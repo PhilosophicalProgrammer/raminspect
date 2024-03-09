@@ -5,7 +5,7 @@ edition = "2021"
 
 license = "GPL-3.0"
 readme = "cargo_readme.md"
-repository = "https://github.com/AaronGehrmann/raminspect"
+repository = "https://github.com/ljgermain/raminspect"
 description = "A library for the arbitrary inspection and manipulation of the memory and code of a process on a Linux system."
 
 [dependencies]
