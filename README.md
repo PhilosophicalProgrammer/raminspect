@@ -6,7 +6,7 @@ It provides functions for finding and replacing search terms in a processes' mem
 
 ## Demonstration of Functionality
 
-demo
+![262029237-7c55e611-93ff-47cc-8a72-a00840991270](https://github.com/ljgermain/raminspect/assets/154016542/22d59c32-163f-4ba6-8860-89545b64c93e)
 
 ### Running an Example
 
