@@ -1,0 +1,13 @@
+[package]
+name = "raminspect"
+version = "0.7.5"
+edition = "2021"
+
+license = "GPL-3.0"
+readme = "cargo_readme.md"
+repository = "https://github.com/AaronGehrmann/raminspect"
+description = "A library for the arbitrary inspection and manipulation of the memory and code of a process on a Linux system."
+
+[dependencies]
+spin = "0.9.1"
+libc = "0.2.147"
