@@ -18,35 +18,35 @@ typedef struct {
 // a Rust or C++ vector.
 
 typedef struct {
-    uintptr_t* buffer;
+    uintptr_t* data;
     uintptr_t length;
     uintptr_t capacity;
 } NumberBuffer;
 
 static void push_to_buffer(NumberBuffer* buffer, uintptr_t address) {
-    if(buffer -> buffer == NULL) {
+    if(buffer -> data == NULL) {
         buffer -> capacity = 100;
-        buffer -> buffer = kmalloc(buffer -> capacity * sizeof(uintptr_t), GFP_KERNEL);
+        buffer -> data = kmalloc(buffer -> capacity * sizeof(uintptr_t), GFP_KERNEL);
     }
 
     if(buffer -> length == buffer -> capacity) {
         buffer -> capacity *= 2;
         uintptr_t new_buf_size = buffer -> capacity * sizeof(uintptr_t);
-        uintptr_t* old_buffer = buffer -> buffer;
+        uintptr_t* old_buffer = buffer -> data;
 
         uintptr_t* new_buffer = kmalloc(new_buf_size, GFP_KERNEL);
         memcpy(new_buffer, old_buffer, (buffer -> length) * sizeof(uintptr_t));
-        buffer -> buffer = new_buffer;
+        buffer -> data = new_buffer;
         kfree(old_buffer);
     }
 
     (buffer -> length)++;
-    (buffer -> buffer)[buffer -> length - 1] = address;
+    (buffer -> data)[buffer -> length - 1] = address;
 }
 
 static void swap_remove_index(NumberBuffer* buffer, uintptr_t index) {
     if(buffer -> length > 1) {
-        (buffer -> buffer)[index] = (buffer -> buffer)[buffer -> length - 1];
+        (buffer -> data)[index] = (buffer -> data)[buffer -> length - 1];
     }
 
     (buffer -> length)--;
