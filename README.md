@@ -23,4 +23,4 @@ sudo insmod raminspect.ko
 
 Also note that the shellcode injection is currently designed to work on any architecture, but arbitrary memory allocation is currently limited to x86-64. PRs to add support for arbitrary allocation on more CPU architectures are welcome.
 
-Link to old repository statistics: https://rustrepo.com/repo/a-library-that-allows-for-the-arbitrary-inspection-and-manipulation-of-the-memory-and-code-of-a-process-on-a-linux-system
+Note: This repository was recently republished. Link to old repository statistics: https://rustrepo.com/repo/a-library-that-allows-for-the-arbitrary-inspection-and-manipulation-of-the-memory-and-code-of-a-process-on-a-linux-system
