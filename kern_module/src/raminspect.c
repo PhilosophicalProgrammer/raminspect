@@ -16,13 +16,8 @@
 // Defines the user-facing interface for interacting with the device file
 #include "fops.h"
 
-// We have to put this inside of an ifdef to make VSCode's intellisense stop
-// complaining about KBUILD_MODNAME being undefined.
-
-#ifdef KBUILD_MODNAME
-    // We have to declare a module license for this to compile
-    MODULE_LICENSE("GPL");
-#endif
+// We have to declare a module license for this to compile
+MODULE_LICENSE("GPL");
 
 // The major number the kernel chooses to assign when we create our
 // temporary device file.
@@ -41,9 +36,8 @@ static char* raminspect_classname = "raminspect_backend";
 static char* raminspect_devname = "raminspect";
 static struct class* raminspect_class;
 
-// TODO: Change access privileges.
 static int perms_uevent(const struct device *dev, struct kobj_uevent_env *env) {
-    add_uevent_var(env, "DEVMODE=%#o", 0604);
+    add_uevent_var(env, "DEVMODE=%#o", 0600);
     return 0;
 }
 
@@ -68,12 +62,6 @@ void raminspect_exit(void) {
     
     // Unregister the device.
     unregister_chrdev(major, raminspect_devname);
-
-    // It is important to reschedule any tasks that the user of this module did not in order to maintain system stability.
-    for(int)
-
-    // Free allocated buffers.
-    kfree();
 }
 
 module_init(raminspect_init);

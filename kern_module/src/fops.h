@@ -4,7 +4,29 @@
 
 // Needed to access process registers
 #include <linux/sched/task_stack.h>
-#include "plist.h"
+
+// The magic number for our `ioctl` definitions. 'r' stands for raminspect.
+#define RAMINSPECT_MAGIC 'r'
+
+// These commands allow a privileged user process to read and write the registers and signal masks
+// of the threads of an arbitrary process. This forms the core basis of the functionality of our
+// framework, and allows for precise control over the state of a process and its execution.
+
+#define GET_THREADS _IOWR(RAMINSPECT_MAGIC, 0, struct thread_request*)
+#define SET_THREADS _IOWR(RAMINSPECT_MAGIC, 1, struct thread_request*)
+
+// These commands allow a privileged user process to arbitrarily control the access privileges (readability,
+// writability, and executability) of another process. This is important for shellcode execution, since it
+// is desirable in that situation to want to overwrite not-usually-writable data at the address of the
+// instruction pointer of the target process.
+
+#define GET_VMA_FLAGS _IOR(RAMINSPECT_MAGIC, 2, struct mprotect_request*)
+#define SET_VMA_FLAGS _IOR(RAMINSPECT_MAGIC, 3, struct mprotect_request*)
+
+// This is sent to and received back from a process using the `*_THREADS` ioctls. It contains
+// the thread ID that the data belongs to in the case of `GET_THREADS`, or the thread ID of
+// the thread to write this data to in the case of `SET_THREADS`. It contains information
+// about the signal mask and registers of the target thread.
 
 struct thread_data {
     struct pt_regs registers;
@@ -12,28 +34,53 @@ struct thread_data {
     pid_t thread_id;
 };
 
+// This is used in the `*_THREADS` ioctls. It contains a buffer of `thread_data` structures, the
+// process ID that they all belong to, and the length of the buffer.
+//
+// In the case of `GET_THREADS`, the buffer is uninitialized and can hold a maximum of `buf_len` elements,
+// and the thread data retrieved by this module from the process will be written into it, updating the
+// buffer length to represent the amount of threads retrieved. If the given buffer length is too small
+// to hold all of the threads, an `ERANGE` error code will be given to the user and they'll have to
+// retry with a larger buffer.
+//
+// In the case of `SET_THREADS`, the buffer is not uninitialized, and the buffer length represents the
+// amount of thread data that was given by the user. Invalid thread IDs will be ignored, and valid
+// thread IDs will have their signal masks and registers updated to match their provided data.
+
 struct thread_request {
     pid_t pid;
     size_t buf_len;
     struct thread_data* threadbuf;
 };
 
-struct task_list {
+// This is used in the `*_VMA_FLAGS` ioctls. It contains a process ID, the start and end address of
+// a memory region within this process, and a set of flags to either get or set, depending on
+// whether or not it's a `GET_VMA_FLAGS` or `SET_VMA_FLAGS` call.
+
+struct mprotect_request {
+    uintptr_t vma_start;
+    uintptr_t vma_end;
+    vm_flags_t flags;
     pid_t pid;
-    struct pointer_list tasks;
-    unsigned long descheduled_at;
 };
 
-// List of pointers to task lists. See above.
-static struct pointer_list task_lists;
-DEFINE_MUTEX(task_lists_mutex);
+// This eliminates code duplication across the different `ioctl` commands. It copies a request structure of
+// the specified type from the user, and then uses the provided `pid` field to fetch the `task_struct` to
+// modify. This can't be a function since it has to be able to terminate the caller on error.
 
-#define RS_MAGIC 123
-#define GET_THREADS _IOWR(RS_MAGIC, 0, struct thread_request*)
-#define SET_THREADS _IOWR(RS_MAGIC, 1, struct thread_request*)
-#define DESCHED_THREADS _IOW(RS_MAGIC, 2, unsigned long)
-#define RESCHED_THREADS _IOW(RS_MAGIC, 3, unsigned long)
-#define REMOTE_MPROTECT _IOW(RS_MAGIC, 4, uintptr_t) 
+#define setup_ioctl(reqty) \
+    struct reqty request; \
+    void* data_ptr = (void*)arg; \
+    if(copy_from_user(&request, (void*)arg, sizeof(struct reqty)) != 0) { \
+        pr_alert("Error: Failed to copy request data from user\n"); \ 
+        return -EINVAL; \
+    } \
+    \
+    struct task_struct* task = pid_task(find_vpid(request.pid), PIDTYPE_PID); \
+    if(task == NULL) { \
+        pr_alert("Error: The target process was not running\n"); \
+        return -EINVAL; \
+    }
 
 static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long arg) {
     switch(cmd) {
@@ -41,40 +88,32 @@ static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long 
         case SET_THREADS:
         
         {
-            void* data_ptr = (void*)arg;
-            struct thread_request request;
-            if(copy_from_user(&request, data_ptr, sizeof(struct thread_request)) != 0) {
-                pr_alert("Error: Failed to copy thread request data from user\n");
-                return -EINVAL;
-            }
-
-            struct task_struct* thread;
-            struct task_struct* task = pid_task(find_vpid(request.pid), PIDTYPE_PID);
-
-            if(task == NULL) {
-                pr_alert("Error: The target process was not running\n");
-                return -EINVAL;
-            }
-
+            setup_ioctl(thread_request);
             size_t buf_size = request.buf_len * sizeof(struct thread_data);
             struct thread_data* buffer = kmalloc(buf_size, GFP_KERNEL);
+            struct task_struct* thread;
 
             if(cmd == GET_THREADS) {
+                // The amount of threads copied so far.
                 size_t copy_count = 0;
 
                 rcu_read_lock();
                 for_each_thread(task, thread) {
                     if(copy_count >= request.buf_len) {
+                        // If the buffer is too small, we return -ERANGE to tell the user to retry with a larger buffer.
                         rcu_read_unlock();
                         kfree(buffer);
                         return -ERANGE;
                     }
 
+                    task_lock(thread);
                     buffer[copy_count++] = (struct thread_data){
                         .registers = *task_pt_regs(thread),
                         .sigmask = thread->blocked,
                         .thread_id = thread->pid
                     };
+
+                    task_unlock(thread);
                 }
 
                 rcu_read_unlock();
@@ -91,12 +130,14 @@ static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long 
                     return -EINVAL;
                 }
             } else {
-
+                // Get thread data from the user.
                 if(copy_from_user(buffer, request.threadbuf, buf_size) != 0) {
                     pr_alert("Error: Failed to copy thread buffer from user\n");
                     kfree(buffer);
                     return -EINVAL;
                 }
+
+                // Update the threads that match the given thread IDs.
 
                 rcu_read_lock();
                 for_each_thread(task, thread) {
@@ -104,8 +145,10 @@ static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long 
                         struct thread_data curr_thread = buffer[i];
 
                         if(thread->pid == curr_thread.thread_id) {
+                            task_lock(thread);
                             thread->blocked = curr_thread.sigmask;
                             *task_pt_regs(thread) = curr_thread.registers;
+                            task_unlock(thread);
                             break;
                         }
                     }
@@ -118,62 +161,30 @@ static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long 
             break;
         }
 
-        case DESCHED_THREADS:
+        case GET_VMA_FLAGS:
+        case SET_VMA_FLAGS:
         
         {
-            // The process ID is provided directly as an argument to the `ioctl` call.
-            struct task_struct* task = pid_task(find_vpid(arg), PIDTYPE_PID);
+            setup_ioctl(mprotect_request);
+            struct vm_area_struct* vma = find_exact_vma(task->mm, request.vma_start, request.vma_end);
 
-            if(task == NULL) {
-                pr_alert("Error: The target process was not running\n");
-                return -EINVAL;
+            if(vma == NULL) {
+                pr_alert("Error Failed to find VMA with specified range\n");
+                return -ENODATA;
             }
 
-            // We don't modify the task list while iterating over it in order to avoid undefined behavior.
-            // Instead, we allocate a growable list of task pointers, store all threads of the provided
-            // PID in that, and then iterate over that once we're done collecting it.
-            struct pointer_list* task_list = kzalloc(sizeof(struct pointer_list), GFP_KERNEL);
-
-            rcu_read_lock();
-            struct task_struct* thread;
-            for_each_thread(task, thread) {
-                push_pointer(task_list, (uintptr_t)thread);
+            if(cmd == SET_VMA_FLAGS) {
+                vm_flags_set(vma, request.flags);
+            } else {
+                return (long)vma->vm_flags;
             }
 
-            rcu_read_unlock();
-            // Now we can adjust the task list accordingly and remove the tasks from it.
-
-            write_lock(&tasklist_lock);
-            for(int i = 0; i < task_list->length; i++) {
-                struct task_struct* task = (struct task_struct*)task_list->data[i];
-                list_del_rcu(&task->tasks);
-            }
-
-            write_unlock(&tasklist_lock);
-            // Since the user will probably reschedule these tasks later, we should store the list for retrieval.
-
-            mutex_lock(&task_lists_mutex);
-            push_pointer(&task_lists, (uintptr_t)task_list);
-            mutex_unlock(&task_lists_mutex);
-            break;
-        }
-
-        case RESCHED_THREADS:
-
-        {
-            reschedule_threads(arg);
-            break;
-        }
-
-        case REMOTE_MPROTECT:
-        
-        {
             break;
         }
 
         default:
             pr_alert("Invalid ioctl command\n");
-            return -EINVAL;
+            return -ENOIOCTLCMD;
     }
 
     return 0;
