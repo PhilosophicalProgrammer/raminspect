@@ -91,6 +91,12 @@ static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long 
             setup_ioctl(thread_request);
             size_t buf_size = request.buf_len * sizeof(struct thread_data);
             struct thread_data* buffer = kmalloc(buf_size, GFP_KERNEL);
+
+            if(buffer == NULL) {
+                pr_alert("Error: Failed to allocate thread data buffer\n");
+                return -ENOMEM;
+            }
+
             struct task_struct* thread;
 
             if(cmd == GET_THREADS) {
