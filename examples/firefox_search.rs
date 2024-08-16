@@ -8,7 +8,7 @@
 fn main() {
     use raminspect::RamInspector;
     // Iterate over all running Firefox instances
-    for pid in raminspect::find_processes("/usr/lib/firefox/firefox") {
+    for pid in raminspect::find_processes("/usr/lib/firefox") {
         let mut inspector = match RamInspector::new(pid) {
             Ok(inspector) => inspector,
             Err(_) => continue,

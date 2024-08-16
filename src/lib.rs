@@ -9,7 +9,9 @@
 // platform support.
 
 #![no_std]
+#![allow(unused)]
 extern crate alloc;
+mod ffi;
 
 use libc::*;
 use core::sync::atomic::Ordering;
@@ -174,33 +176,31 @@ pub fn find_processes(name_contains: &str) -> Vec<i32> {
 /// //! although you may have to click on the search bar again in order for it to
 /// //! render the new text.
 /// 
-/// fn main() {
-///     use raminspect::RamInspector;
-///     // Iterate over all running Firefox instances
-///     for pid in raminspect::find_processes("/usr/lib/firefox/firefox") {
-///         let mut inspector = match RamInspector::new(pid) {
-///             Ok(inspector) => inspector,
-///             Err(_) => continue,
-///         };
-///         
-///         for (proc_addr, memory_region) in inspector.search_for_term(b"Old search text").unwrap() {
-///             if !memory_region.writable() {
-///                 continue;
-///             }
-/// 
-///             unsafe {
-///                 // This is safe because modifying the text in the Firefox search bar will not crash
-///                 // the browser or negatively impact system stability in any way.
-/// 
-///                 println!("Writing to process virtual address: 0x{:X}", proc_addr);
-///                 inspector.queue_write(proc_addr, b"New search text");
-///             }
+/// use raminspect::RamInspector;
+/// // Iterate over all running Firefox instances
+/// for pid in raminspect::find_processes("/usr/lib/firefox/firefox") {
+///     let mut inspector = match RamInspector::new(pid) {
+///         Ok(inspector) => inspector,
+///         Err(_) => continue,
+///     };
+///     
+///     for (proc_addr, memory_region) in inspector.search_for_term(b"Old search text").unwrap() {
+///         if !memory_region.writable() {
+///             continue;
 ///         }
-/// 
+///
 ///         unsafe {
-///             // This is safe since the process is not currently resumed, which would possibly cause a data race.
-///             inspector.flush().unwrap();
+///             // This is safe because modifying the text in the Firefox search bar will not crash
+///             // the browser or negatively impact system stability in any way.
+///
+///             println!("Writing to process virtual address: 0x{:X}", proc_addr);
+///             inspector.queue_write(proc_addr, b"New search text");
 ///         }
+///     }
+/// 
+///     unsafe {
+///         // This is safe since the process is not currently resumed, which would possibly cause a data race.
+///         inspector.flush().unwrap();
 ///     }
 /// }
 /// ```

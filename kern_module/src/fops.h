@@ -2,230 +2,172 @@
 #include <linux/ioctl.h>
 #include <asm/ioctl.h>
 
-// Needed for sleeping
-#include <asm/delay.h>
-
 // Needed to access process registers
 #include <linux/sched/task_stack.h>
+#include "plist.h"
 
-// Saved process state for later restoration
-typedef struct {
-    int pid;
-    struct pt_regs regs;
-} SavedRegisters;
+struct thread_data {
+    struct pt_regs registers;
+    sigset_t sigmask;
+    pid_t thread_id;
+};
 
-// A growable buffer of pointer-sized integers, similar in behavior to 
-// a Rust or C++ vector.
+struct thread_request {
+    pid_t pid;
+    size_t buf_len;
+    struct thread_data* threadbuf;
+};
 
-typedef struct {
-    uintptr_t* data;
-    uintptr_t length;
-    uintptr_t capacity;
-} NumberBuffer;
+struct task_list {
+    pid_t pid;
+    struct pointer_list tasks;
+    unsigned long descheduled_at;
+};
 
-static void push_to_buffer(NumberBuffer* buffer, uintptr_t address) {
-    if(buffer -> data == NULL) {
-        buffer -> capacity = 100;
-        buffer -> data = kmalloc(buffer -> capacity * sizeof(uintptr_t), GFP_KERNEL);
-    }
-
-    if(buffer -> length == buffer -> capacity) {
-        buffer -> capacity *= 2;
-        uintptr_t new_buf_size = buffer -> capacity * sizeof(uintptr_t);
-        uintptr_t* old_buffer = buffer -> data;
-
-        uintptr_t* new_buffer = kmalloc(new_buf_size, GFP_KERNEL);
-        memcpy(new_buffer, old_buffer, (buffer -> length) * sizeof(uintptr_t));
-        buffer -> data = new_buffer;
-        kfree(old_buffer);
-    }
-
-    (buffer -> length)++;
-    (buffer -> data)[buffer -> length - 1] = address;
-}
-
-static void swap_remove_index(NumberBuffer* buffer, uintptr_t index) {
-    if(buffer -> length > 1) {
-        (buffer -> data)[index] = (buffer -> data)[buffer -> length - 1];
-    }
-
-    (buffer -> length)--;
-}
-
-// A list of modified VMAs represented by their unique starting address in their
-// process.
-
-static NumberBuffer modified_addr_list;
-DEFINE_MUTEX(modified_addr_list_lock);
-
-// A list of hijacked process IDs which have sent an unacknowledged finishing signal to 
-// the kernel module. Used in the WAIT_FOR_FINISH command.
-static NumberBuffer finish_sig_buf;
-DEFINE_MUTEX(finish_sig_buf_lock);
-
-// A list of pointers to saved process register states for later restoration by the hijacker
-// so that program execution can continue as if nothing happened after their shellcode
-// finishes executing.
-
-static NumberBuffer saved_regs_buf;
-DEFINE_MUTEX(saved_regs_buf_lock);
-
-typedef struct {
-    int pid;
-    uint64_t instruction_pointer;
-} InstructionPointerRequest;
+// List of pointers to task lists. See above.
+static struct pointer_list task_lists;
+DEFINE_MUTEX(task_lists_mutex);
 
 #define RS_MAGIC 123
-#define WAIT_FOR_FINISH _IOW(RS_MAGIC, 0, int)
-#define TOGGLE_EXEC_WRITE _IOW(RS_MAGIC, 1, int)
-#define GET_INST_PTR _IOWR(RS_MAGIC, 2, InstructionPointerRequest)
-#define RESTORE_REGS _IOW(RS_MAGIC, 3, int)
+#define GET_THREADS _IOWR(RS_MAGIC, 0, struct thread_request*)
+#define SET_THREADS _IOWR(RS_MAGIC, 1, struct thread_request*)
+#define DESCHED_THREADS _IOW(RS_MAGIC, 2, unsigned long)
+#define RESCHED_THREADS _IOW(RS_MAGIC, 3, unsigned long)
+#define REMOTE_MPROTECT _IOW(RS_MAGIC, 4, uintptr_t) 
 
 static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long arg) {
     switch(cmd) {
-        case TOGGLE_EXEC_WRITE: {
-            int pid = (int)arg;
-            struct task_struct* task = pid_task(find_vpid(pid), PIDTYPE_PID);
-
-            if(task == NULL) {
-                pr_alert("Error: The target process was not running!\n");
-                return -EINVAL;
-            }
-
-            struct vm_area_struct* current_vma;
-            struct mm_struct* mm = task -> mm;
-
-            VMA_ITERATOR(vmi, mm, 0);
-            for_each_vma(vmi, current_vma) {
-                unsigned long vma_start = current_vma->vm_start;
-                vm_flags_t flags = current_vma -> vm_flags;
-
-                if((flags & VM_EXEC) != 0) {
-                    mutex_lock(&modified_addr_list_lock);
-
-                    unsigned long i;
-                    unsigned long addr_index;
-                    
-                    bool found_addr = false;
-                    for(i = 0; i < modified_addr_list.length; i++) {
-                        if(modified_addr_list.buffer[i] == vma_start) {
-                            addr_index = i;
-                            break;
-                        }
-                    }
-                    
-                    if(found_addr) {
-                        swap_remove_index(&modified_addr_list, addr_index);
-                        vm_flags_set(current_vma, (current_vma -> vm_flags) & ~VM_WRITE);
-                    } else if((flags & VM_WRITE) == 0) {
-                        push_to_buffer(&modified_addr_list, vma_start);
-                        vm_flags_set(current_vma, (current_vma -> vm_flags) | VM_WRITE);
-                    }
-
-                    mutex_unlock(&modified_addr_list_lock);
-                }
-            }
-
-            break;
-        }
-
-        case WAIT_FOR_FINISH: {
-            int pid = (int)arg;
-            uintptr_t index = 0;
-            bool found_index = false;
-
-            while(!found_index) {
-                if(pid_task(find_vpid(pid), PIDTYPE_PID) == NULL) {
-                    pr_alert("Error: The hijacked process unexpectedly terminated.\n");
-                    return -ECANCELED;
-                }
-
-                uintptr_t i;
-                mutex_lock(&finish_sig_buf_lock);
-                for(i = 0; i < finish_sig_buf.length; i++) {
-                    if(finish_sig_buf.buffer[i] == pid) {
-                        found_index = true;
-                        index = i;
-                        break;
-                    }
-                }
-
-                if(found_index) {
-                    swap_remove_index(&finish_sig_buf, index);
-                }
-
-                mutex_unlock(&finish_sig_buf_lock);
-                udelay(1);
-            }
-            
-            break;
-        }
-
-        case GET_INST_PTR: {
+        case GET_THREADS:
+        case SET_THREADS:
+        
+        {
             void* data_ptr = (void*)arg;
-            InstructionPointerRequest request;
-            if(copy_from_user(&request, data_ptr, sizeof(InstructionPointerRequest)) != 0) {
-                pr_alert("Error: Failed to copy instruction pointer request data from user\n");
+            struct thread_request request;
+            if(copy_from_user(&request, data_ptr, sizeof(struct thread_request)) != 0) {
+                pr_alert("Error: Failed to copy thread request data from user\n");
                 return -EINVAL;
             }
 
+            struct task_struct* thread;
             struct task_struct* task = pid_task(find_vpid(request.pid), PIDTYPE_PID);
 
             if(task == NULL) {
-                pr_alert("Error: The target process was not running!\n");
+                pr_alert("Error: The target process was not running\n");
                 return -EINVAL;
             }
 
-            struct pt_regs* regs = task_pt_regs(task);
-            SavedRegisters* allocated_regs = kmalloc(sizeof(SavedRegisters), GFP_KERNEL);
+            size_t buf_size = request.buf_len * sizeof(struct thread_data);
+            struct thread_data* buffer = kmalloc(buf_size, GFP_KERNEL);
 
-            allocated_regs -> regs = *regs;
-            allocated_regs -> pid = request.pid;
+            if(cmd == GET_THREADS) {
+                size_t copy_count = 0;
 
-            mutex_lock(&saved_regs_buf_lock);
-            push_to_buffer(&saved_regs_buf, (uintptr_t)(allocated_regs));
-            mutex_unlock(&saved_regs_buf_lock);
+                rcu_read_lock();
+                for_each_thread(task, thread) {
+                    if(copy_count >= request.buf_len) {
+                        rcu_read_unlock();
+                        kfree(buffer);
+                        return -ERANGE;
+                    }
 
-            request.instruction_pointer = instruction_pointer(regs);
-            if(copy_to_user(data_ptr, &request, sizeof(InstructionPointerRequest)) != 0) {
-                pr_alert("Error: Failed to copy instruction pointer request data to user\n");
-                return -EINVAL;
+                    buffer[copy_count++] = (struct thread_data){
+                        .registers = *task_pt_regs(thread),
+                        .sigmask = thread->blocked,
+                        .thread_id = thread->pid
+                    };
+                }
+
+                rcu_read_unlock();
+                if(copy_to_user((void*)request.threadbuf, (void*)buffer, copy_count * sizeof(struct thread_data)) != 0) {
+                    pr_alert("Error: Failed to copy thread buffer to user\n");
+                    kfree(buffer);
+                    return -EINVAL;
+                }
+
+                kfree(buffer);
+                request.buf_len = copy_count;
+                if(copy_to_user(data_ptr, (void*)&request, sizeof(struct thread_request)) != 0) {
+                    pr_alert("Error: Failed to copy thread request to user\n");
+                    return -EINVAL;
+                }
+            } else {
+
+                if(copy_from_user(buffer, request.threadbuf, buf_size) != 0) {
+                    pr_alert("Error: Failed to copy thread buffer from user\n");
+                    kfree(buffer);
+                    return -EINVAL;
+                }
+
+                rcu_read_lock();
+                for_each_thread(task, thread) {
+                    for(int i = 0; i < request.buf_len; i++) {
+                        struct thread_data curr_thread = buffer[i];
+
+                        if(thread->pid == curr_thread.thread_id) {
+                            thread->blocked = curr_thread.sigmask;
+                            *task_pt_regs(thread) = curr_thread.registers;
+                            break;
+                        }
+                    }
+                }
+
+                rcu_read_unlock();
+                kfree(buffer);
             }
 
             break;
         }
 
-        case RESTORE_REGS: {
-            uintptr_t i;
-            int pid = (int)arg;
-            struct task_struct* task = pid_task(find_vpid(pid), PIDTYPE_PID);
+        case DESCHED_THREADS:
+        
+        {
+            // The process ID is provided directly as an argument to the `ioctl` call.
+            struct task_struct* task = pid_task(find_vpid(arg), PIDTYPE_PID);
 
             if(task == NULL) {
-                pr_alert("Error: The target process is not currently running!\n");
+                pr_alert("Error: The target process was not running\n");
                 return -EINVAL;
             }
 
-            bool found_pid = false;
-            uintptr_t pid_index = 0;
-            mutex_lock(&saved_regs_buf_lock);
-            for(i = 0; i < saved_regs_buf.length; i++) {
-                if(((SavedRegisters*)(saved_regs_buf.buffer[i])) -> pid == pid) {
-                    found_pid = true;
-                    pid_index = i;
-                    break;
-                }
+            // We don't modify the task list while iterating over it in order to avoid undefined behavior.
+            // Instead, we allocate a growable list of task pointers, store all threads of the provided
+            // PID in that, and then iterate over that once we're done collecting it.
+            struct pointer_list* task_list = kzalloc(sizeof(struct pointer_list), GFP_KERNEL);
+
+            rcu_read_lock();
+            struct task_struct* thread;
+            for_each_thread(task, thread) {
+                push_pointer(task_list, (uintptr_t)thread);
             }
 
-            if(!found_pid) {
-                pr_alert("Error: No such process has had its registers saved!\n");
-                mutex_unlock(&saved_regs_buf_lock);
-                return -EINVAL;
+            rcu_read_unlock();
+            // Now we can adjust the task list accordingly and remove the tasks from it.
+
+            write_lock(&tasklist_lock);
+            for(int i = 0; i < task_list->length; i++) {
+                struct task_struct* task = (struct task_struct*)task_list->data[i];
+                list_del_rcu(&task->tasks);
             }
 
-            *task_pt_regs(task) = ((SavedRegisters*)(saved_regs_buf.buffer[pid_index])) -> regs;
-            kfree((void*)(saved_regs_buf.buffer[pid_index]));
-            swap_remove_index(&saved_regs_buf, pid_index);
-            mutex_unlock(&saved_regs_buf_lock);
+            write_unlock(&tasklist_lock);
+            // Since the user will probably reschedule these tasks later, we should store the list for retrieval.
+
+            mutex_lock(&task_lists_mutex);
+            push_pointer(&task_lists, (uintptr_t)task_list);
+            mutex_unlock(&task_lists_mutex);
+            break;
+        }
+
+        case RESCHED_THREADS:
+
+        {
+            reschedule_threads(arg);
+            break;
+        }
+
+        case REMOTE_MPROTECT:
+        
+        {
             break;
         }
 
@@ -241,53 +183,27 @@ static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long 
 // operations at once, so we don't need to lock / release anything in the 
 // open and close handlers.
 
-int no_op_open(struct inode* _file_info, struct file* _file) {
+static int no_op_open(struct inode* _file_info, struct file* _file) {
     return 0;
 }
 
-int no_op_close(struct inode* _file_info, struct file* _file) {
+static int no_op_close(struct inode* _file_info, struct file* _file) {
     return 0;
 }
 
-// A read of exactly one byte acts as a finishing signal given by a hijacked process.
-// All other reads are no-ops.
-
-ssize_t maybe_finish_signal(struct file *fptr, char __user *buffer, size_t blen, loff_t *offs) {
-    if(blen == 1) {
-        mutex_lock(&finish_sig_buf_lock);
-        
-        uintptr_t i;
-        int pid_num = current -> pid;
-        pr_info("Notice: Got finishing signal from process with PID %d\n", pid_num);
-        
-        // If we already received an unacknowledged finishing signal from this process
-        // we won't waste extra memory in the buffer.
-
-        for(i = 0; i < finish_sig_buf.length; i++) {
-            if(finish_sig_buf.buffer[i] == pid_num) {
-                pr_alert("Error: Got duplicate finishing signal from process with PID %d\n", pid_num);
-                mutex_unlock(&finish_sig_buf_lock);
-                return -EINVAL;
-            }
-        }
-
-        push_to_buffer(&finish_sig_buf, pid_num);
-        mutex_unlock(&finish_sig_buf_lock);
-        return 0;
-    }
-
-    pr_alert("Error: Got invalid read with buffer length of %ld\n", blen);
-    return -EINVAL;
+// Reads and writes should also do nothing.
+static ssize_t no_op_read(struct file *fptr, char __user *buffer, size_t buf_len, loff_t *offs) {
+    return 0;
 }
 
-ssize_t no_op_write(struct file *fptr, const char __user *buffer, size_t buf_len, loff_t *offs) {
+static ssize_t no_op_write(struct file *fptr, const char __user *buffer, size_t buf_len, loff_t *offs) {
     return 0;
 }
 
 static struct file_operations raminspect_fops = {
     .open = no_op_open,
+    .read = no_op_read,
     .write = no_op_write,
     .release = no_op_close,
-    .read = maybe_finish_signal,
     .unlocked_ioctl = raminspect_ioctl,
 };

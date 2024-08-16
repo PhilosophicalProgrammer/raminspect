@@ -1,2 +1,10 @@
 /target
 /Cargo.lock
+*.ko
+*.o
+*.mod
+*.mod.c
+*.order
+*.symvers
+*.cmd
+*.d

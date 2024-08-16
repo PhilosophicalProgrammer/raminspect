@@ -41,20 +41,13 @@ static char* raminspect_classname = "raminspect_backend";
 static char* raminspect_devname = "raminspect";
 static struct class* raminspect_class;
 
-// Modifies access privileges to the device file to make it readable by
-// hijacked user processes not running as root.
-
+// TODO: Change access privileges.
 static int perms_uevent(const struct device *dev, struct kobj_uevent_env *env) {
     add_uevent_var(env, "DEVMODE=%#o", 0604);
     return 0;
 }
 
 int raminspect_init(void) {
-    // Initialize the mutexes controlling access to different buffers we use.
-    mutex_init(&modified_addr_list_lock);
-    mutex_init(&finish_sig_buf_lock);
-    mutex_init(&saved_regs_buf_lock);
-
     // Create a new device file.
     major = register_chrdev(0, raminspect_devname, &raminspect_fops);
 
@@ -72,31 +65,15 @@ void raminspect_exit(void) {
     // Destroy the device file and class.
     device_destroy(raminspect_class, MKDEV(major, minor));
     class_destroy(raminspect_class);
-
+    
     // Unregister the device.
     unregister_chrdev(major, raminspect_devname);
 
-    // Free allocated resources.
-    mutex_destroy(&finish_sig_buf_lock);
-    mutex_destroy(&saved_regs_buf_lock);
-    mutex_destroy(&modified_addr_list_lock);
+    // It is important to reschedule any tasks that the user of this module did not in order to maintain system stability.
+    for(int)
 
-    if(finish_sig_buf.buffer != NULL) {
-        kfree(finish_sig_buf.buffer);
-    }
-
-    if(modified_addr_list.buffer != NULL) {
-        kfree(modified_addr_list.buffer);
-    }
-
-    if(saved_regs_buf.buffer != NULL) {
-        uintptr_t i;
-        for(i = 0; i < saved_regs_buf.length; i++) {
-            kfree((void*)(saved_regs_buf.buffer[i]));
-        }
-
-        kfree(saved_regs_buf.buffer);
-    }
+    // Free allocated buffers.
+    kfree();
 }
 
 module_init(raminspect_init);
