@@ -5,23 +5,24 @@
 // Needed to access process registers
 #include <linux/sched/task_stack.h>
 
-// The magic number for our `ioctl` definitions. 'r' stands for raminspect.
+// The magic number for our `ioctl` definitions. 'r' stands for raminspect. Note: Any changes made to the `ioctl`
+// interface in this file must also be made in the Rust bindings to it to maintain compatibility.
 #define RAMINSPECT_MAGIC 'r'
 
 // These commands allow a privileged user process to read and write the registers and signal masks
 // of the threads of an arbitrary process. This forms the core basis of the functionality of our
 // framework, and allows for precise control over the state of a process and its execution.
 
-#define GET_THREADS _IOWR(RAMINSPECT_MAGIC, 0, struct thread_request*)
-#define SET_THREADS _IOWR(RAMINSPECT_MAGIC, 1, struct thread_request*)
+#define GET_THREADS _IOWR(RAMINSPECT_MAGIC, 0, struct thread_request)
+#define SET_THREADS _IOWR(RAMINSPECT_MAGIC, 1, struct thread_request)
 
 // These commands allow a privileged user process to arbitrarily control the access privileges (readability,
 // writability, and executability) of another process. This is important for shellcode execution, since it
 // is desirable in that situation to want to overwrite not-usually-writable data at the address of the
 // instruction pointer of the target process.
 
-#define GET_VMA_FLAGS _IOR(RAMINSPECT_MAGIC, 2, struct mprotect_request*)
-#define SET_VMA_FLAGS _IOR(RAMINSPECT_MAGIC, 3, struct mprotect_request*)
+#define GET_VMA_FLAGS _IOWR(RAMINSPECT_MAGIC, 2, struct vma_flags_request)
+#define SET_VMA_FLAGS _IOWR(RAMINSPECT_MAGIC, 3, struct vma_flags_request)
 
 // This is sent to and received back from a process using the `*_THREADS` ioctls. It contains
 // the thread ID that the data belongs to in the case of `GET_THREADS`, or the thread ID of
@@ -48,16 +49,16 @@ struct thread_data {
 // thread IDs will have their signal masks and registers updated to match their provided data.
 
 struct thread_request {
-    pid_t pid;
-    size_t buf_len;
     struct thread_data* threadbuf;
+    size_t buf_len;
+    pid_t pid;
 };
 
 // This is used in the `*_VMA_FLAGS` ioctls. It contains a process ID, the start and end address of
 // a memory region within this process, and a set of flags to either get or set, depending on
 // whether or not it's a `GET_VMA_FLAGS` or `SET_VMA_FLAGS` call.
 
-struct mprotect_request {
+struct vma_flags_request {
     uintptr_t vma_start;
     uintptr_t vma_end;
     vm_flags_t flags;
@@ -71,15 +72,16 @@ struct mprotect_request {
 #define setup_ioctl(reqty) \
     struct reqty request; \
     void* data_ptr = (void*)arg; \
-    if(copy_from_user(&request, (void*)arg, sizeof(struct reqty)) != 0) { \
-        pr_alert("Error: Failed to copy request data from user\n"); \ 
-        return -EINVAL; \
+    if(copy_from_user(&request, data_ptr, sizeof(struct reqty)) != 0) { \
+        pr_alert("Error: Failed to copy request data from user\n"); \
+        return -EFAULT; \
     } \
     \
     struct task_struct* task = pid_task(find_vpid(request.pid), PIDTYPE_PID); \
+    \
     if(task == NULL) { \
         pr_alert("Error: The target process was not running\n"); \
-        return -EINVAL; \
+        return -ESRCH; \
     }
 
 static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long arg) {
@@ -126,21 +128,21 @@ static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long 
                 if(copy_to_user((void*)request.threadbuf, (void*)buffer, copy_count * sizeof(struct thread_data)) != 0) {
                     pr_alert("Error: Failed to copy thread buffer to user\n");
                     kfree(buffer);
-                    return -EINVAL;
+                    return -EFAULT;
                 }
 
                 kfree(buffer);
                 request.buf_len = copy_count;
                 if(copy_to_user(data_ptr, (void*)&request, sizeof(struct thread_request)) != 0) {
                     pr_alert("Error: Failed to copy thread request to user\n");
-                    return -EINVAL;
+                    return -EFAULT;
                 }
             } else {
                 // Get thread data from the user.
                 if(copy_from_user(buffer, request.threadbuf, buf_size) != 0) {
                     pr_alert("Error: Failed to copy thread buffer from user\n");
                     kfree(buffer);
-                    return -EINVAL;
+                    return -EFAULT;
                 }
 
                 // Update the threads that match the given thread IDs.
@@ -171,26 +173,33 @@ static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long 
         case SET_VMA_FLAGS:
         
         {
-            setup_ioctl(mprotect_request);
+            setup_ioctl(vma_flags_request);
             struct vm_area_struct* vma = find_exact_vma(task->mm, request.vma_start, request.vma_end);
 
             if(vma == NULL) {
-                pr_alert("Error Failed to find VMA with specified range\n");
+                pr_alert("Error: Failed to find VMA with specified range\n");
                 return -ENODATA;
             }
 
             if(cmd == SET_VMA_FLAGS) {
                 vm_flags_set(vma, request.flags);
             } else {
-                return (long)vma->vm_flags;
+                request.flags = vma->vm_flags;
+                if(copy_to_user(data_ptr, &request, sizeof(struct vma_flags_request)) != 0) {
+                    pr_alert("Error: Failed to copy VMA flags to user\n");
+                    return -EFAULT;
+                }
             }
 
             break;
         }
 
         default:
+
+        {
             pr_alert("Invalid ioctl command\n");
-            return -ENOIOCTLCMD;
+            return -ENOTTY;
+        }
     }
 
     return 0;
