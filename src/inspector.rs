@@ -1,12 +1,33 @@
+//! This provides the structure that represents the interface of the library, [`RamInspector`]. See its
+//! documentation for more information.
+
+use either::Either;
+use std::io::IoSlice;
+use std::io::IoSliceMut;
+
+use nix::libc;
+use nix::unistd::Pid;
+use nix::unistd::getpgid;
+use nix::unistd::sysconf;
+use nix::unistd::SysconfVar;
+use nix::sys::signal::killpg;
+use nix::sys::signal::SIGSTOP;
+use nix::sys::signal::SIGCONT;
+use nix::sys::uio::RemoteIoVec;
+use nix::sys::uio::process_vm_readv;
+use nix::sys::uio::process_vm_writev;
+
+use libc::pid_t;
+use procfs::process::Process;
+
+use crate::error::Result;
+use crate::kapi::RawInspector;
 use crate::region::MemoryRegion;
+use crate::error::RamInspectError as Error;
 
 /// This is the primary interface used by the crate to search through, read, and modify an
-/// arbitrary processes' memory and code.
-/// 
-/// Note that when an inspector is created for a process, the process will be paused until
-/// the inspector is dropped in order to ensure that we have exclusive access to the
-/// processes' memory, unless it is manually resumed through a call to 
-/// [`RamInspector::resume_process`].
+/// arbitrary processes' memory, registers, and code. All uses of this library must either
+/// directly or indirectly go go through this structure. 
 /// 
 /// # Example Usage
 /// 
@@ -20,8 +41,8 @@ use crate::region::MemoryRegion;
 /// 
 /// use raminspect::RamInspector;
 /// // Iterate over all running Firefox instances
-/// for pid in raminspect::find_processes("/usr/lib/firefox/firefox") {
-///     let mut inspector = match RamInspector::new(pid) {
+/// for process in raminspect::find_processes("/usr/lib/firefox/firefox") {
+///     let inspector = match RamInspector::new(process.pid) {
 ///         Ok(inspector) => inspector,
 ///         Err(_) => continue,
 ///     };
@@ -48,134 +69,106 @@ use crate::region::MemoryRegion;
 /// ```
 
 pub struct RamInspector {
-    pid: i32,
+    proc: Process,
     max_iovs: usize,
-    proc_maps_file: *mut FILE,
-    resume_count: Arc<AtomicUsize>,
-    write_requests: Vec<(usize, Vec<u8>)>,
+    process_paused: bool,
+
+    // Lazily initialized so that we don't require the kernel module to be loaded for functions that don't need it.
+    kapi: Option<RawInspector>,
 }
 
+/// See [`RamInspector::bulk_iov_op`].
+type ReadOrWrites<'a> = Either<Vec<(usize, &'a mut [u8])>, Vec<(usize, &'a [u8])>>; 
+
 impl RamInspector {
-    /// Creates a new inspector attached to the specified process ID. This will pause the target process until
-    /// the inspector is dropped or until it's manually resumed using [`RamInspector::resume_process`].
-    /// 
-    /// Note that creating two inspectors simultaneously referring to the same process is not supported, and attempting 
-    /// to do so will return a [`RamInspectError`] of the kind [`RamInspectError::InspectorAlreadyExists`]. If you want 
-    /// to do this you should access the same inspector instead, synchronizing said access if you're in a multithreaded 
-    /// environment.
+    /// Creates a new inspector attached to the specified process ID. Note: You should probably pause the
+    /// process while performing operations using this structure if you want consistent results. See
+    /// [`RamInspector::do_while_paused`] for more information.
     
-    pub fn new(pid: i32) -> Result<Self, RamInspectError> {
-        unsafe {
-            let maps_path = format!("/proc/{}/maps\0", pid);
-            let proc_maps_file = fopen(maps_path.as_ptr() as _, "r\0".as_ptr() as _).into_result(
-                RamInspectError::FailedToOpenProcMaps
-            )?;
-    
-            // Pause the target process with a SIGSTOP signal
-            if let Err(error) = kill(pid, SIGSTOP).into_result(RamInspectError::FailedToPauseProcess) {
-                fclose(proc_maps_file);
-                return Err(error);
-            }
-
-            let max_iovs = sysconf(_SC_IOV_MAX);
-
-            if max_iovs < 0 {
-                fclose(proc_maps_file);
-                panic!("Unsupported kernel version or platform.");
-            }
-
-            Ok(RamInspector {
-                pid,
-                proc_maps_file,
-                write_requests: Vec::new(),
-                max_iovs: max_iovs as usize,
-                resume_count: Arc::new(AtomicUsize::new(0)),
-            })
-        }
-    }
-
-    /// Resumes the target process, returning a handle that pauses the process again when dropped,
-    /// assuming no other handles currently exist. Use this carefully, since writing to the 
-    /// processes' memory while it's resumed may cause data races with the processes' code.
-    /// 
-    /// If multiple handles are created before all the others are dropped, the process will remain 
-    /// resumed until every one of its resume handles is dropped and dropping an individual handle 
-    /// while other handles for the process still exist will have no effect. This ensures 
-    /// correctness in multi-threaded contexts.
-    
-    pub fn resume_process(&self) -> Result<ResumeHandle, RamInspectError> {
-        if self.resume_count.fetch_add(1, Ordering::SeqCst) == 0 {
-            unsafe {
-                kill(self.pid, SIGCONT).into_result(RamInspectError::FailedToResumeProcess)?;
-            }
-        }
-
-        Ok(ResumeHandle {
-            pid: self.pid,
-            count: Arc::clone(&self.resume_count),
+    pub fn new(pid: pid_t) -> Result<Self> {
+        Ok(Self {
+            kapi: None,
+            process_paused: false,
+            proc: Process::new(pid)?,
+            max_iovs: sysconf(SysconfVar::IOV_MAX)?.ok_or(Error::SysconfFailed)? as usize
         })
     }
 
-    /// Allows for the execution of arbitrary code in the context of the process. This is unsafe
-    /// because there are no checks in place to ensure the provided code is safe. The provided
-    /// code should also be completely position independent, since it could be loaded anywhere.
+    /// This provides a way to pause a process and ensure that data races with the target process and other
+    /// unexpected behavior cannot occur upon modification. In other words, if you're making any sort of
+    /// modification to a process, you should probably do so inside a `do_while_paused` block, although
+    /// this is not enforced since there are cases where it is not desirable to do so.
     /// 
-    /// This function waits for a signal from the shellcode that it is finished executing, given
-    /// by reading exactly one byte from the raminspect device file. It does not time out, so if
-    /// you forget to send the signal you'll have to terminate the hijacked process for this 
-    /// function to resume and the shellcode to finish executing.
+    /// The kernel API especially requires extensive use of this interface to ensure that retrieved
+    /// thread data doesn't become outdated. See [`RamInspector::kernapi`] and [`RawInspector::get_threads`]
+    /// for more information.
     /// 
-    /// The second argument is a callback that is called once the shellcode is finished executing
-    /// that takes in a mutable reference to the inspector and the starting address of the loaded 
-    /// shellcode as arguments, before the old instructions are restored in memory. This can be
-    /// useful if you want to retrieve information from the shellcode after it's done executing.
+    /// It is important to note that this function does not just pause the target process. It is more
+    /// aggressive and pauses the entire process group of the process. This is to ensure that child
+    /// or parent processes that share the same memory as the target do not experience instability.
+    /// It also has the benefit of reducing the risk of detection.
     /// 
-    /// Note that this restores the previous register state automatically, so you don't have to 
-    /// save and restore registers in your shellcode manually if you're writing it in assembly.
+    /// # Example Usage
+    /// 
+    /// ```rust
+    /// use raminspect::RamInspector;
+    /// let mut inspector = RamInspector::new(1234); // Replace 1234 with your target PID
+    /// 
+    /// inspector.do_while_paused(|inspector| {
+    ///     // .. do whatever ..
+    /// });
+    /// ```
     
-    pub unsafe fn execute_shellcode<F: FnMut(&mut RamInspector, usize) -> Result<(), RamInspectError>>(
-        &mut self,
-        shellcode: &[u8],
-        mut callback: F,
-    ) -> Result<(), RamInspectError> {
-        let device_fd_wrapper = FileWrapper::open("/dev/raminspect\0", O_RDWR, RamInspectError::FailedToOpenDeviceFile)?;
-        let device_fd = device_fd_wrapper.descriptor;
+    pub fn do_while_paused<F: FnMut(&mut RamInspector) -> Result<()>>(&mut self, mut callback: F) -> Result<()> {
+        if self.process_paused {
+            // If we're already paused, call the callback right away.
+            return callback(self);
+        }
 
-        // Temporarily make the code of the process writable so we can modify it.
-        ioctl(device_fd, TOGGLE_EXEC_WRITE, self.pid as c_ulong).into_result(RamInspectError::ProcessTerminated)?;
+        self.process_paused = true;
+        // We wrap this within its own context so that we can still set `process_paused` to false on error.
 
-        // Get process instruction pointer. ptrace and /proc/stat don't work here, at least on my machine, so we
-        // rely on the kernel module to do it for us instead.
+        let res = (|| {
+            let pid = Pid::from_raw(self.proc.pid);
+            let pgid = getpgid(Some(pid))?;
+            killpg(pgid, SIGSTOP)?;
+            callback(self)?;
+            killpg(pgid, SIGCONT)?;
+            Ok(())
+        })();
 
-        let mut inst_ptr_request = InstructionPointerRequest {
-            pid: self.pid,
-            instruction_pointer: 0,
-        };
+        self.process_paused = false;
+        res
+    }
 
-        ioctl(device_fd, GET_INST_PTR, &mut inst_ptr_request).into_result(RamInspectError::ProcessTerminated)?;
-        let instruction_pointer = inst_ptr_request.instruction_pointer as usize;
-        
-        // Save the old code and load the new code
-        let old_code = self.read_vec(instruction_pointer, shellcode.len())?;
-        self.write_to_address(instruction_pointer, shellcode)?;
+    /// This provides access to the raw kernel API. The kernel module must be loaded in order for
+    /// this function to work. The `kapi` handle is lazily initialized, and so after this is successfully
+    /// called once it will become a zero-cost operation to call it again. See the documentation
+    /// of [`RawInspector`] for more information and usage guidelines.
+    /// 
+    /// Note: Before using the kernel API, you should consider if the higher-level API suits your use case,
+    /// since it is both simpler and safer to use.
+    
+    pub fn kernapi(&mut self) -> Result<&RawInspector> {
+        if self.kapi.is_some() {
+            Ok(self.kapi.as_ref().unwrap())
+        } else {
+            self.kapi = Some(RawInspector::new(self.proc.pid)?);
+            self.kernapi()
+        }
+    }
 
-        // Resume the process and wait for the code to finish executing
-        kill(self.pid, SIGCONT).into_result(RamInspectError::ProcessTerminated)?;
-        ioctl(device_fd, WAIT_FOR_FINISH, self.pid as c_ulong).into_result(RamInspectError::ProcessTerminated)?;
-
-        // Then pause the process again and call the callback
-        kill(self.pid, SIGSTOP).into_result(RamInspectError::ProcessTerminated)?;
-        callback(self, instruction_pointer)?;
-
-        // Restore the old code and registers
-        self.write_to_address(instruction_pointer, &old_code)?;
-        ioctl(device_fd, RESTORE_REGS, self.pid as c_ulong).into_result(RamInspectError::ProcessTerminated)?;
-
-        // Leaving the target code as writable when it was originally read-only would present 
-        // a fairly big security issue, so we make the modified regions read-only again after 
-        // we're done by performing another ioctl.
-        
-        ioctl(device_fd, TOGGLE_EXEC_WRITE, self.pid as c_ulong).into_result(RamInspectError::ProcessTerminated)?;
+    /// Allows for the execution of arbitrary code in the context of the process. The
+    /// provided code should be completely position independent, since it could be
+    /// loaded anywhere.
+    /// 
+    /// # Safety
+    /// 
+    /// This is unsafe because there are no checks in place to ensure the provided code is safe,
+    /// and in fact such checks would be impossible to implement (cc. halting problem). Use
+    /// with caution.
+    
+    pub unsafe fn execute_shellcode(&mut self, _shellcode: &[u8]) -> Result<()> {
         Ok(())
     }
 
@@ -187,24 +180,8 @@ impl RamInspector {
     /// times in a hot loop; try to make a few big allocations instead of many small ones for better 
     /// performance.
     
-    pub fn allocate_buffer(&mut self, size: usize) -> Result<usize, RamInspectError> {
-        assert!(cfg!(target_arch = "x86_64"), "`allocate_buffer` is currently only supported on x86-64.");
-        let mut shellcode: Vec<u8> = include_bytes!("../alloc-blob.bin").to_vec();
-        let alloc_size_offset = shellcode.len() - 8;
-        let out_ptr_offset = shellcode.len() - 16;
-
-        shellcode[alloc_size_offset..alloc_size_offset + 8].copy_from_slice(
-            &size.to_le_bytes()
-        );
-        
-        unsafe {
-            let mut addr_bytes = [0; 8];
-            self.execute_shellcode(&shellcode, |this, inst_ptr| {
-                this.read_address(inst_ptr + out_ptr_offset, &mut addr_bytes)
-            })?;
-
-            Ok(u64::from_le_bytes(addr_bytes) as usize)
-        }
+    pub fn allocate_buffer(&mut self, _size: usize) -> Result<usize> {
+        unimplemented!()
     }
 
     /// Fills the output buffer with memory read starting from the target address. This can fail
@@ -215,10 +192,11 @@ impl RamInspector {
     /// (e.g. a memory mapped file), in which case you should always handle errors.
     /// 
     /// If you're making large amounts of small reads, prefer [`RamInspector::read_bulk`] over
-    /// this function, which only performs one I/O syscall.
+    /// this function, which very significantly reduces the amount of syscalls needed to
+    /// perform the read operation.
     
-    pub fn read_address(&mut self, addr: usize, out_buf: &mut [u8]) -> Result<(), RamInspectError> {
-        self.read_bulk(core::iter::once((addr, out_buf)))
+    pub fn read_address(&self, addr: usize, out_buf: &mut [u8]) -> Result<()> {
+        self.read_bulk(vec![(addr, out_buf)])
     }
 
     /// A convenience function that reads the specified amount of bytes from the target address
@@ -229,31 +207,77 @@ impl RamInspector {
     /// inspector.read_address(addr, &mut out);
     /// ```
     
-    pub fn read_vec(&mut self, addr: usize, count: usize) -> Result<Vec<u8>, RamInspectError> {
+    pub fn read_vec(&self, addr: usize, count: usize) -> Result<Vec<u8>> {
         let mut out = vec![0; count];
         self.read_address(addr, &mut out)?;
         Ok(out)
     }
 
-    // Used internally to simplify bulk reads and writes of data that use iovecs
-    unsafe fn exec_iov_op(&self, local_iovs: Vec<iovec>, remote_iovs: Vec<iovec>, iov_op: unsafe extern "C" fn(
-        pid_t,
-        *const iovec, c_ulong,
-        *const iovec, c_ulong, c_ulong
-    ) -> isize, err: RamInspectError) -> Result<(), RamInspectError> {
-        assert_eq!(local_iovs.len(), remote_iovs.len());
+    /// Writes the provided data to the provided address. You should probably only do this while
+    /// the process is paused in order to avoid data races and other forms of instability. See
+    /// [`RamInspector::do_while_paused`] for more information. 
+    /// 
+    /// If you're making large amounts of writes, prefer [`RamInspector::write_bulk`] over this
+    /// function, which very significantly reduces the amount of syscalls needed to perform the
+    /// write operation.
+    /// 
+    /// # Safety
+    /// 
+    /// This is unsafe since directly writing to an arbitrary address in an arbitrary processes' 
+    /// memory is not memory safe at all; it is assumed that the caller knows what they're doing.
+    
+    pub unsafe fn write_to_address(&self, addr: usize, in_buf: &[u8]) -> Result<()> {
+        self.write_bulk(vec![(addr, in_buf)])
+    }
+
+    /// Used internally to simplify bulk reads and writes of data that use iovecs
+    
+    unsafe fn bulk_iov_op(&self, ops: ReadOrWrites) -> Result<()> {
+        let remotes: Vec<RemoteIoVec> = either::for_both!(ops.as_ref(), ops => ops.iter().map(|(base, buf)| RemoteIoVec {
+            base: *base,
+            len: buf.len()
+        }).collect());
+
+        let mut io_slices: Either<Vec<IoSliceMut>, Vec<IoSlice>> = ops.map_either(
+            |s| s.into_iter().map(|(_, buf)| IoSliceMut::new(buf)).collect(),
+            |s| s.into_iter().map(|(_, buf)| IoSlice::new(buf)).collect(),
+        );
+
+        let blen = either::for_both!(io_slices.as_ref(), s => s.len());
+        assert_eq!(remotes.len(), blen);
 
         let mut i = 0;
-        while i < local_iovs.len() {
-            let end_index = (i + self.max_iovs).min(local_iovs.len());
-            let num_iovs = (end_index - i) as _;
+        while i < blen {
+            let end_index = (i + self.max_iovs).min(blen);
+            let mut total_copied = 0;
 
-            iov_op(
-                self.pid,
-                local_iovs[i..end_index].as_ptr(), num_iovs,
-                remote_iovs[i..end_index].as_ptr(), num_iovs, 0,
-            ).into_result(err)?;
-            i += self.max_iovs;
+            // We keep attempting to copy until the full amount was read or written. If zero bytes were copied in this loop,
+            // then we return early with `Error::Partial`.
+
+            'copy: while i < end_index {
+                let pid = Pid::from_raw(self.proc.pid);
+                let amount_copied = match io_slices.as_mut() {
+                    Either::Left(read) => process_vm_readv(pid, &mut read[i..end_index], &remotes[i..end_index]).map_err(|_| Error::FailedToReadMem)?,
+                    Either::Right(write) => process_vm_writev(pid, &write[i..end_index], &remotes[i..end_index]).map_err(|_| Error::FailedToWriteMem)?,
+                };
+
+                total_copied += amount_copied;
+                if amount_copied == 0 { return Err(Error::Partial(total_copied)); }
+
+                // Check if the full amount was copied.
+                let mut expected_amount = 0;
+
+                while i < end_index {
+                    expected_amount += either::for_both!(io_slices.as_ref(), s => s[i].len());
+
+                    if expected_amount > amount_copied {
+                        // Try again starting from this index if less than the expected amount was copied.
+                        continue 'copy;
+                    }
+
+                    i += 1;
+                }
+            }
         }
 
         Ok(())
@@ -261,151 +285,36 @@ impl RamInspector {
 
     /// Performs many memory reads at once in one I/O syscall, taking in an iterator of address / output
     /// buffer pairs as an argument. This can be much faster than [`RamInspector::read_address`] if 
-    /// you're making many small data reads, and should be preferred in that case. This has the
-    /// same failure conditions as `read_address`.
+    /// you're making many reads, and should be preferred in that case. This has the same failure
+    /// conditions as `read_address`.
     
-    pub fn read_bulk<T: AsMut<[u8]>, I: Iterator<Item = (usize, T)>>(
-        &mut self,
-        reads: I,
-    ) -> Result<(), RamInspectError> {
-        let mut local_iovs = Vec::with_capacity(reads.size_hint().0);
-        let mut remote_iovs = Vec::with_capacity(reads.size_hint().0);
-
-        for (address, mut buf) in reads {
-            let buf = buf.as_mut();
-            local_iovs.push(iovec {
-                iov_len: buf.len(),
-                iov_base: buf.as_mut_ptr() as _,
-            });
-
-            remote_iovs.push(iovec {
-                iov_len: buf.len(),
-                iov_base: address as _,
-            });
-        }
-
+    pub fn read_bulk(&self, reads: Vec<(usize, &mut [u8])>) -> Result<()> {
         unsafe {
-            self.exec_iov_op(
-                local_iovs, remote_iovs, 
-                process_vm_readv, RamInspectError::FailedToReadMem,
-            )?;
+            // Reading memory from a process shouldn't be unsafe unless it's MMIO, but this is generally not exposed to userspace.
+            self.bulk_iov_op(Either::Left(reads))
         }
-
-        Ok(())
     }
 
-    /// A convenience function for performing one write of arbitrary data to an arbitrary memory address. 
-    /// This does not flush the current write buffer, and is guaranteed to perform exactly one write.
+    /// Write-side counterpart of [`RamInspector::read_bulk`]. Like `read_bulk`, this can be significantly
+    /// faster than the single-operation counterpart if you're moving multiple pieces of data, and should
+    /// be preferred in that case.
     /// 
-    /// If you're making many writes, use [`RamInspector::queue_write`] in combination with [`RamInspector::flush`]
-    /// instead. This has the same safety constraints as `queue_write`, and is just a thin wrapper around it.
-    
-    pub unsafe fn write_to_address(&mut self, addr: usize, buf: &[u8]) -> Result<(), RamInspectError> {
-        let mut old_buffer = Vec::new(); 
-        core::mem::swap(&mut self.write_requests, &mut old_buffer);
-        
-        self.queue_write(addr, buf);
-        let res = self.flush();
-
-        self.write_requests = old_buffer;
-        res
-    }
-
-    /// Queues a write of the specified data to the specified memory address of the target process. 
-    /// Writes will fail if the target process unexpectedly terminated, if the specified address is 
-    /// not part of a writable region of the target processes' memory, and if the end address (the 
-    /// start address plus the written buffers' length) is not part of the same memory region.
+    /// # Safety
     /// 
-    /// This is unsafe since directly writing to an arbitrary address in an arbitrary processes' 
-    /// memory is not memory safe at all; it is assumed that the caller knows what they're doing.
-    /// 
-    /// Note that this has no effect until the [`RamInspector::flush`] method is called, for
-    /// performance reasons.
-    
-    pub unsafe fn queue_write(&mut self, addr: usize, buf: &[u8]) {
-        self.write_requests.push((addr, buf.to_vec()));
-    }
+    /// This has the same failure conditions and safety concerns as [`RamInspector::write_to_address`].
+    /// See its documentation for more information.
 
-    /// Flushes the current buffer of writes, performing all of them in one I/O syscall. This is unsafe 
-    /// for the same reasons that `queue_write` is unsafe, and is called automatically upon dropping
-    /// the inspector. See [`RamInspector::queue_write`] for more information.
-    
-    pub unsafe fn flush(&mut self) -> Result<(), RamInspectError> {
-        let local_iovs = self.write_requests.iter().map(|(_addr, buf)| iovec {
-            iov_base: buf.as_ptr() as _,
-            iov_len: buf.len(),
-        }).collect::<Vec<iovec>>();
-
-        let remote_iovs = self.write_requests.iter().map(|(addr, buf)| iovec {
-            iov_base: (*addr) as _,
-            iov_len: buf.len(),
-        }).collect::<Vec<iovec>>();
-        
-        self.exec_iov_op(local_iovs, remote_iovs, process_vm_writev, RamInspectError::FailedToWriteMem)?;
-        self.write_requests.clear();
-        Ok(())
+    pub unsafe fn write_bulk(&self, writes: Vec<(usize, &[u8])>) -> Result<()> {
+        self.bulk_iov_op(Either::Right(writes))
     }
 
     /// A function that returns an iterator over the target processes' memory regions, generated by reading its
-    /// /proc/maps file. See the documentation of [`MemoryRegion`] for more information.
+    /// `/proc/maps` and `/proc/smaps` files. See the documentation of [`MemoryRegion`] for more information.
     
-    pub fn regions(&mut self) -> IntoIter<MemoryRegion> {
-        unsafe {
-            fseek(self.proc_maps_file, 0, SEEK_SET);
-        }
-
-        // For more details about what this calculation in particular means, see the section
-        // for /proc/pid/maps at: https://man7.org/linux/man-pages/man5/proc.5.html
-
-        const MAX_INODE_DIGITS: usize = 16;
-        const MAX_PATH_LENGTH: usize = 4096;
-        const MAX_LINE_LENGTH: usize = "ffffffffffffffff-ffffffffffffffff rwxp ffffffff ff:ff ".len() + 
-                                       MAX_INODE_DIGITS + "      ".len() + MAX_PATH_LENGTH;
-
-        let mut regions = Vec::new();
-        let mut line: [u8; MAX_LINE_LENGTH] = [0; MAX_LINE_LENGTH];
-        while unsafe { !fgets(line.as_mut_ptr() as _, line.len() as i32, self.proc_maps_file).is_null() } {
-            let line_str = core::str::from_utf8(
-                &line[..line.iter().position(|byte| *byte == 0).unwrap_or(line.len())]
-            ).unwrap().trim();
-
-            // Skip any bad or unneeded memory regions
-            if line_str.ends_with("(deleted)") || line_str.ends_with("[vvar]")  || line_str.ends_with("[vdso]")  || line_str.ends_with("[vsyscall]") {
-                continue;    
-            }
-
-            let mut chars = line_str.chars();
-            // The lines read from /proc/PID/maps conform to the following format:
-            //
-            // HEX_START_ADDR-HEX_END_ADDR rwx(p or s)... etc
-            //
-            // Where rwx describes whether or not the described memory region can be read from, written 
-            // to, and executed. If not the corresponding character will be dashed out. For example, 
-            // read-only executable memory areas would show an r-x in the string and write-only 
-            // non-executable ones would show a -w-. 
-            //
-            // The next character following this (the p or s) describes whether or not the specified region 
-            // is private or shared, and cannot be dashed out.
-
-            let start_addr_string = (&mut chars).take_while(char::is_ascii_hexdigit).collect::<String>();
-            let end_addr_string = (&mut chars).take_while(char::is_ascii_hexdigit).collect::<String>();
-            let start_addr = usize::from_str_radix(&start_addr_string, 16).unwrap();
-            let end_addr = usize::from_str_radix(&end_addr_string, 16).unwrap();
-            assert!(end_addr > start_addr);
-
-            regions.push(MemoryRegion {
-                start_addr,
-                length: end_addr - start_addr,
-                readable: chars.next().unwrap() == 'r',
-                writeable: chars.next().unwrap() == 'w',
-                executable: chars.next().unwrap() == 'x',
-                shared: chars.next().unwrap() == 's',
-            });
-
-            line = [0; MAX_LINE_LENGTH];
-        }
-
-        regions.into_iter()
+    pub fn regions(&mut self) -> Result<impl Iterator<Item = MemoryRegion>> {
+        Ok(self.proc.maps()?.into_iter().map(|mmap| MemoryRegion {
+            inner: mmap
+        }))
     }
 
     /// Searches the target processes' memory for the specified data, and returns a list of
@@ -413,13 +322,13 @@ impl RamInspector {
     /// This will fail if the process terminated unexpectedly, but it should succeed in 
     /// basically any other case.
     
-    pub fn search_for_term(&mut self, search_term: &[u8]) -> Result<Vec<(usize, MemoryRegion)>, RamInspectError> {
+    pub fn search_for_term(&mut self, search_term: &[u8]) -> Result<Vec<(usize, MemoryRegion)>> {
         if search_term.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut out = Vec::new();
-        for region in self.regions().filter(|region| region.readable) {
+        for region in self.regions()?.filter(|region| region.readable()) {
             if region.len() < search_term.len() {
                 continue;
             }
@@ -427,21 +336,12 @@ impl RamInspector {
             if let Ok(data) = region.get_contents(self) {
                 for i in 0..data.len() - search_term.len() {
                     if data[i..].starts_with(search_term) {
-                        out.push((region.start_addr + i, region.clone()));
+                        out.push((region.start_addr() + i, region.clone()));
                     }
                 }
             }
         }
 
         Ok(out)
-    }
-}
-
-impl Drop for RamInspector {
-    fn drop(&mut self) {
-        unsafe {
-            // Flush all buffers.
-            let _ = self.flush();
-        }
     }
 }

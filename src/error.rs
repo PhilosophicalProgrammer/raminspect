@@ -7,12 +7,15 @@ use std::fmt::Formatter;
 
 use std::process::ExitCode;
 use std::process::Termination;
+
 use nix::errno::Errno;
+use procfs::ProcError;
 
 /// This can represent any possible error returned by this library's functions. It is not
 /// intended to be used directly by users. Instead, you should use the [`Result`] type
 /// provided by this module.
 
+#[derive(Debug)]
 pub enum RamInspectError {
     /// Root permissions are necessary to use the kernel API.
     NoRootPerms,
@@ -29,44 +32,75 @@ pub enum RamInspectError {
     /// An invalid `ioctl` command code was used.
     InvalidCommand,
 
-    /// An unknown error occurred.
-    Unknown,
+    /// The call to `sysconf` to retrieve `max_iovs` returned no information.
+    SysconfFailed,
+
+    /// Failed to read memory.
+    FailedToReadMem,
+
+    /// Failed to write memory.
+    FailedToWriteMem,
+
+    /// The requested operation only completed partially.
+    Partial(usize),
+
+    /// `nix` returned an unknown error.
+    Errno(Errno),
+
+    /// `procfs` returned an error.
+    ProcFs(ProcError)
 }
 
 impl RamInspectError {
-    /// Creates an error from a C error code. Used by the kernel API.
+    /// Converts an error code from the kernel module into an error variant.
     
-    pub(crate) fn from_errno(errno: Errno) -> Self {
+    pub(crate) fn kern_errno(errno: Errno) -> Self {
         match errno {
             Errno::ENOTTY => Self::InvalidCommand,
             Errno::EFAULT => Self::InvalidAddress,
             Errno::ESRCH => Self::NotFound,
-            _ => Self::Unknown,
+            _ => Self::from(errno)
         }
     }
 }
 
-pub type Result<T> = std::result::Result<T, RamInspectError>;
+impl From<Errno> for RamInspectError {
+    fn from(errno: Errno) -> Self {
+        Self::Errno(errno)
+    }
+}
 
-impl Debug for RamInspectError {
+impl From<ProcError> for RamInspectError {
+    fn from(perr: ProcError) -> Self {
+        Self::ProcFs(perr)
+    }
+}
+
+impl Display for RamInspectError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            // Initialization errors.
             RamInspectError::NoRootPerms => "Root privileges are required in order to use the kernel-level interface. This is by design.",
             RamInspectError::FailedToOpenDevice => "Failed to open `/dev/raminspect`. Are you sure that the kernel module is loaded?",
+            RamInspectError::SysconfFailed => "Failed to retrieve `max_iovs` from `sysconf`.",
+
+            // Kernel module errors.
             RamInspectError::InvalidAddress => "Invalid data was provided to the kernel module. This shouldn't happen if you're using the high-level \
             library-provided interface, in which case you should open a GitHub issue. If you're using the raw interface, however, then you should \
             investigate the soundness of your program and the documentation.",
 
             RamInspectError::InvalidCommand => "Invalid `ioctl` command. This is always an indication of a problem in the library. Please open a GitHub issue with an MRE.",
             RamInspectError::NotFound => "The target process was not found, meaning that either the provided PID was wrong or that it unexpectedly terminated.",
-            RamInspectError::Unknown => "An unknown error occurred. Please open a GitHub issue with an MRE."
-        })
-    }
-}
 
-impl Display for RamInspectError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        Debug::fmt(self, formatter)
+            // Memory reading / writing errors.
+            RamInspectError::Partial(n) => return write!(formatter, "The requested operation only completed partially: {} bytes were read or written", n),
+            RamInspectError::FailedToWriteMem => "Failed to write to the specified address.",
+            RamInspectError::FailedToReadMem => "Failed to read the specified address.",
+
+            // Crate-specific errors from either `nix` or `procfs`
+            RamInspectError::Errno(errno) => return Display::fmt(errno, formatter),
+            RamInspectError::ProcFs(perr) => return Display::fmt(perr, formatter)
+        })
     }
 }
 
@@ -76,3 +110,7 @@ impl Termination for RamInspectError {
         ExitCode::FAILURE
     }
 }
+
+impl std::error::Error for RamInspectError {}
+/// The result type for this library. Prefer this over direct usage of [`std::result::Result`]. 
+pub type Result<T> = std::result::Result<T, RamInspectError>;

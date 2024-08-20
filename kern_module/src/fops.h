@@ -16,18 +16,17 @@
 #define GET_THREADS _IOWR(RAMINSPECT_MAGIC, 0, struct thread_request)
 #define SET_THREADS _IOWR(RAMINSPECT_MAGIC, 1, struct thread_request)
 
-// These commands allow a privileged user process to arbitrarily control the access privileges (readability,
+// This command allows a privileged user process to arbitrarily control the access privileges (readability,
 // writability, and executability) of another process. This is important for shellcode execution, since it
 // is desirable in that situation to want to overwrite not-usually-writable data at the address of the
 // instruction pointer of the target process.
 
-#define GET_VMA_FLAGS _IOWR(RAMINSPECT_MAGIC, 2, struct vma_flags_request)
-#define SET_VMA_FLAGS _IOWR(RAMINSPECT_MAGIC, 3, struct vma_flags_request)
+#define SET_VMA_FLAGS _IOR(RAMINSPECT_MAGIC, 2, struct vma_flags_request)
 
 // This is sent to and received back from a process using the `*_THREADS` ioctls. It contains
 // the thread ID that the data belongs to in the case of `GET_THREADS`, or the thread ID of
-// the thread to write this data to in the case of `SET_THREADS`. It contains information
-// about the signal mask and registers of the target thread.
+// the thread to write this data to in the case of `SET_THREADS`. It also contains
+// information about the signal mask and registers of the target thread.
 
 struct thread_data {
     struct pt_regs registers;
@@ -54,14 +53,13 @@ struct thread_request {
     pid_t pid;
 };
 
-// This is used in the `*_VMA_FLAGS` ioctls. It contains a process ID, the start and end address of
-// a memory region within this process, and a set of flags to either get or set, depending on
-// whether or not it's a `GET_VMA_FLAGS` or `SET_VMA_FLAGS` call.
+// This is used in the `SET_VMA_FLAGS` ioctl. It contains a process ID, the start and end address of
+// a memory region within this process, and the new set of flags to apply to the memory region.
 
 struct vma_flags_request {
     uintptr_t vma_start;
     uintptr_t vma_end;
-    vm_flags_t flags;
+    uint32_t flags;
     pid_t pid;
 };
 
@@ -169,7 +167,6 @@ static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long 
             break;
         }
 
-        case GET_VMA_FLAGS:
         case SET_VMA_FLAGS:
         
         {
@@ -181,16 +178,9 @@ static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long 
                 return -ENODATA;
             }
 
-            if(cmd == SET_VMA_FLAGS) {
-                vm_flags_set(vma, request.flags);
-            } else {
-                request.flags = vma->vm_flags;
-                if(copy_to_user(data_ptr, &request, sizeof(struct vma_flags_request)) != 0) {
-                    pr_alert("Error: Failed to copy VMA flags to user\n");
-                    return -EFAULT;
-                }
-            }
-
+            // The higher 32-bits of the flags (which only exist on 64-bit platforms) are not exposed to userspace via
+            // `/proc/smaps` and so they should be preserved through an `or` with the old flags.
+            vm_flags_set(vma, (vm_flags_t)request.flags | ((vma->vm_flags >> 32) << 32));
             break;
         }
 

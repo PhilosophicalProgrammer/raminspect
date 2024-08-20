@@ -3,32 +3,32 @@
 //! which ties all of the components of the kernel API together, for more information.
 
 mod ioctl;
-pub mod flags;
 pub mod tlist;
 pub mod registers;
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::mem::MaybeUninit;
 
-use nix::libc::c_int;
 use nix::libc::pid_t;
-use nix::libc::c_ulong;
-
 use nix::unistd::Uid;
 use nix::errno::Errno;
 
 use ioctl::*;
-use flags::*;
 use tlist::ThreadList;
 use crate::error::Result;
-use crate::region::MemoryRegion;
 use crate::error::RamInspectError as Error;
 
-/// This structure is used internally by the library to provide an interface to the raw kernel APIs
-/// provided by the kernel module via `ioctl`. It is made public to enable advanced usage that involves
-/// directly reading and writing thread registers and signal masks, which is necessary for some
-/// applications.
+use crate::region::VmFlags;
+use crate::region::MemoryRegion;
+
+// Used in docs.
+#[allow(unused_imports)]
+use crate::inspector::RamInspector;
+
+/// This structure is used internally by the library to provide an interface to the raw kernel API
+/// provided by the kernel module via `ioctl`. It is exposed publicly to enable powerful and advanced
+/// usage that involves directly reading and writing thread registers and signal masks, which is
+/// necessary for some applications.
 /// 
 /// This cannot be created directly. Instead, it should be accessed via the [`RamInspector::kernapi`]
 /// method after creating a higher-level `RamInspector` structure for a process. Note that it is
@@ -37,17 +37,19 @@ use crate::error::RamInspectError as Error;
 /// 
 /// # Example Usage
 /// 
-/// This example modifies the stack pointer of the main thread of a process using the raw API:
+/// This example modifies the stack pointer of the main thread of a process using the kernel API:
 /// 
 /// ```rust
 /// use raminspect::RamInspector;
-/// let new_stack_addr = 0x10000; // Replace this with the new address of the top of the stack.
+/// let new_stack_addr = 0x10000; // Replace this with the new address of the top of the new stack.
 /// let mut inspector = RamInspector::new(1234)?; // Replace 1234 with the PID you want to modify.
+/// let kapi = inspector.kernapi()?;
 /// 
-/// let mut kapi = inspector.kernapi()?;
-/// let mut threads = kapi.get_threads()?;
-/// *threads.main().registers.stack_ptr() = new_stack_addr;
-/// kapi.set_threads(&threads)?;
+/// inspector.do_while_paused(|| {
+///     let mut threads = kapi.get_threads()?;
+///     *threads.main().registers.stack_ptr() = new_stack_addr;
+///     kapi.set_threads(&threads)?;
+/// })?;
 /// ```
 
 pub struct RawInspector {
@@ -58,7 +60,7 @@ pub struct RawInspector {
 impl RawInspector {
     /// Creates a new raw inspector.
     pub(crate) fn new(pid: pid_t) -> Result<Self> {
-        if(!Uid::effective().is_root()) {
+        if !Uid::effective().is_root() {
             return Err(Error::NoRootPerms);
         }
 
@@ -69,6 +71,32 @@ impl RawInspector {
             })?
         })
     }
+
+    /// This function allows for the retrieval of the registers and signal masks of all of the active threads
+    /// of an arbitrary process. This can be used for inspecting the state of the process, or it can be used
+    /// to modify it when used in conjunction with [`RawInspector::set_threads`].
+    /// 
+    /// Information retrieved using this function is essentially worthless if the process is resumed, since it
+    /// will have likely changed beyond recognition by the time you finish processing it. This should generally
+    /// only be called inside of a [`RamInspector::do_while_paused`] block for that reason. It is fully safe
+    /// to use since data is only being read and not modified (i.e. it does not interfere with process
+    /// execution in any way).
+    ///
+    /// # Example Usage
+    /// 
+    /// This example retrieves the instruction pointer of the main thread of a process:
+    /// 
+    /// ```rust
+    /// use raminspect::RamInspector;
+    /// let mut inspector = RamInspector::new(1234)?; // Replace 1234 with your target process ID
+    /// let kapi = inspector.kernapi()?;
+    /// 
+    /// inspector.do_while_paused(|inspector| {
+    ///     // `ThreadList` provides a convenience function for retrieving the main thread from the list.
+    ///     let inst_ptr = *kapi.get_threads()?.main().registers.inst_ptr();
+    ///     println!("Process instruction pointer: 0x{:X}", inst_ptr);
+    /// })?;
+    /// ```
 
     pub fn get_threads(&self) -> Result<ThreadList> {
         // This is in a loop so that we can retry the `ioctl` call with a larger buffer if the buffer is too small.
@@ -111,61 +139,48 @@ impl RawInspector {
                             continue;
                         },
 
-                        _ => return Err(Error::from_errno(errno))
+                        _ => return Err(Error::kern_errno(errno))
                     }
                 }
             }
         }
     }
 
-    pub unsafe fn set_threads(&self, threads: &ThreadList) -> Result<c_int> {
-        let mut request = ThreadRequest {
+    /// This allows for the arbitrary modification of the registers and signal masks of all of the threads of a
+    /// running process. The [`ThreadList`] argument is obtained via [`RawInspector::get_threads`]. As with the
+    /// rest of the kernel API functions, the process should be paused with [`RamInspector::do_while_paused`]
+    /// before using it in order to ensure correctness and stability.
+    /// 
+    /// # Safety
+    /// 
+    /// This is very powerful and dangerous functionality that allows for completely controlling the memory state and execution of
+    /// a process when used in conjunction with the higher-level direct memory access functions (see [`RamInspector::regions`]
+    /// and [`RamInspector::write_to_address`]). No checks are in place, or indeed would even be possible to implement,
+    /// that ensure that the changes you make to the underlying process are safe and correct. As a consequence, this
+    /// function is marked as unsafe in *bold letters*. Use with caution.
+    /// 
+    /// # Example Usage
+    /// 
+    /// The top-level documentation of this structure provides an example. Link: [`RawInspector`]
+    
+    pub unsafe fn set_threads(&self, threads: &ThreadList) -> Result<()> {
+        set_threads(self.device.as_raw_fd(), &mut ThreadRequest {
             // Casting to a `*mut` pointer is safe here since `set_threads` doesn't actually modify any data in the buffer.
             thread_buffer: threads.as_ptr() as *mut ThreadData,
             buf_len: threads.len(),
             pid: self.pid,
-        };
-
-        set_threads(self.device.as_raw_fd(), &mut request).map_err(Error::from_errno)
+        }).map_err(Error::kern_errno)?;
+        Ok(())
     }
 
-    /// Gets the raw access flags of a provided memory region. You should prefer to use the
-    /// methods directly provided by [`MemoryRegion`] if possible, since this is harder to
-    /// use and requires that the kernel module as loaded.
-    /// 
-    /// The return value of this function is a bitfield. See the [`flags`] module for a
-    /// comprehensive list of flag definitions.
-    /// 
-    /// # Example Usage
-    /// 
-    /// See [`MemoryRegion::set_vma_flags`], which provides a thorough example of how code
-    /// injection can be achieved through flag modification. Flag definitions can be found
-    /// in the [`crate::flags`] module.
-    
-    pub(crate) fn get_vma_flags(&self, region: &MemoryRegion) -> Result<vm_flags_t> {
-        let mut request = VMAFlagsRequest {
-            vma_start: region.start_addr(),
-            vma_end: region.end_addr(),
-            pid: self.pid,
-            flags: 0,
-        };
-
-        unsafe {
-            match get_vma_flags(self.device.as_raw_fd(), &mut request) {
-                Ok(_) => Ok(request.flags),
-                Err(errno) => Err(Error::from_errno(errno))
-            }
-        }
-    }
-
-    /// Modifies the access flags of a memory region. Always use this in conjunction with [`RawInspector::get_vma_flags`]
-    /// in order to preserve the flags that you don't want to change, otherwise there could be unexpected behavior.
+    /// Modifies the access flags of a memory region. Always use this in conjunction with [`MemoryRegion::flags`] in
+    /// order to preserve the flags that you don't want to change, otherwise there could be unexpected behavior.
     /// 
     /// # Safety
     /// 
     /// Modifying the access permissions of an arbitrary memory area is a fundamentally memory-unsafe operation. Done
-    /// incorrectly, it could interfere with invariants that a program assumes to be true and cause instability. Use
-    /// this with caution.
+    /// incorrectly, it could interfere with invariants that a program assumes to be true and cause instability or
+    /// crashes. Use this with caution.
     /// 
     /// # Example Usage
     /// 
@@ -174,51 +189,43 @@ impl RawInspector {
     /// demonstration rather than something that actually functions in practice.
     /// 
     /// If you want to successfully inject code, then see [`RamInspector::execute_shellcode`], which essentially
-    /// does the same thing as this example, but with additional measures in place to avoid detection and restore
-    /// the state of the process afterwards:
+    /// does the same thing as this example, but with additional measures in place to puase the other threads,
+    /// avoid detection, and restore the state of the process afterwards:
     /// 
     /// ```rust
     /// use raminspect::RamInspector;
-    /// use raminspect::kapi::flags::VM_WRITE;
+    /// use raminspect::region::VmFlags;
     /// let mut inspector = RamInspector::new(1234)?; // Replace 1234 with your target PID
     /// let injected_code = include_bytes!("your_shellcode.bin"); // Put whatever instructions you want here
     /// 
     /// // Leaving the process resumed while doing this would lead to us writing to an outdated instruction pointer,
-    /// // and nothing would actually execute.
+    /// // and nothing would actually execute, so we use `do_while_paused`. This is recommended for any use of the
+    /// // kernel API in order to maintain process stability.
     /// 
-    /// inspector.do_while_paused(|| unsafe {
+    /// let kapi = inspector.kernapi()?;
+    /// inspector.do_while_paused(|inspector| unsafe {
     ///     // Make the memory region containing the main threads' instruction pointer writable so that we can modify it.
+    ///     let ip = kapi.get_threads()?.main().registers.inst_ptr();
     /// 
-    ///     let kapi = inspector.kernapi()?;
-    ///     let ptr = kapi.get_threads()?.main().registers.inst_ptr();
-    /// 
-    ///     // This is guaranteed to exist, so it's safe to unwrap.
-    ///     let code_region = inspector.regions().find(|region| region.addr_range().contains(ptr)).unwrap();
-    ///     
-    ///     let old_flags = kapi.get_vma_flags(code_region)?;
-    ///     kapi.set_vma_flags(code_region, old_flags | VM_WRITE)?;
+    ///     // This is guaranteed to exist, so it's safe to unwrap here.
+    ///     let mut code_region = inspector.regions().find(|region| region.addr_range().contains(ip)).unwrap();
+    ///     kapi.set_vma_flags(&mut code_region, code_region.flags() | VmFlags::WR)?;
     /// 
     ///     // Now that it's writable, we insert our code.
     ///     inspector.write_to_address(code_region.start_addr, injected_code)?;
-    /// 
-    ///     // Then we restore the old flags.
-    ///     code_region.set_raw_flags(old_flags, kapi);
     /// })?;
     /// 
     /// // By now your injected code should be executing.
     /// ```
     
-    pub(crate) unsafe fn set_vma_flags(&self, region: &mut MemoryRegion, flags: vm_flags_t) -> Result<()> {
+    pub unsafe fn set_vma_flags(&self, region: &mut MemoryRegion, flags: VmFlags) -> Result<()> {
+        region.inner.extension.vm_flags = flags;
         set_vma_flags(self.device.as_raw_fd(), &mut VMAFlagsRequest {
             vma_start: region.start_addr(),
             vma_end: region.end_addr(),
             pid: self.pid,
             flags,
-        });
-
-        region.readable = (flags & VM_READ) != 0;
-        region.writable = (flags & VM_WRITE) != 0;
-        region.executable = (flags & VM_EXEC) != 0;
+        }).map_err(Error::kern_errno)?;
         Ok(())
     }
 }

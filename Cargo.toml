@@ -9,4 +9,6 @@ repository = "https://github.com/ljgermain/raminspect"
 description = "A library for the arbitrary inspection and manipulation of the memory and code of a process on a Linux system."
 
 [dependencies]
-nix = { version = "0.29", features = ["ioctl", "signal", "user"] }
+procfs = "0.16"
+either = "1.13"
+nix = { version = "0.29", features = ["ioctl", "signal", "user", "process", "uio"] }

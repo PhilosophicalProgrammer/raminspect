@@ -1,8 +1,14 @@
 //! This module provides convenience functions for finding the process ID of the process that
 //! you would like to modify, which must be done before you can create a [`RamInspector`].
-//! See the docs of [`find_processes`] and [`iter_processes`] for more information.
+//! See the documentation of [`find_processes`] and [`iter_processes`] for more
+//! information.
+
 use std::vec::IntoIter;
 use nix::libc::pid_t;
+
+// Used in docs.
+#[allow(unused_imports)]
+use crate::inspector::RamInspector;
 
 /// A structure representing a process ID associated with its command invocation text, which
 /// usually contains the name of the program. Exposing ways to access this information makes
@@ -24,7 +30,10 @@ pub struct Process {
 /// # Example Usage
 /// 
 /// ```rust
-/// 
+/// // Iterate over all userspace processes.
+/// for pid in raminspect::iter_processes().filter(|proc| !proc.cmdline.contains("kworker")) {
+///     // .. do whatever ..
+/// }
 /// ```
 
 pub fn iter_processes() -> IntoIter<Process> {

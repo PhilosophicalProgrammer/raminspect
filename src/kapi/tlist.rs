@@ -1,5 +1,7 @@
 //! This module provides the [`ThreadList`] structure. See its documentation for more information.
 
+// Used in doc references.
+#[allow(unused_imports)]
 use super::RawInspector;
 use super::ioctl::ThreadData;
 
@@ -21,7 +23,7 @@ impl ThreadList {
     /// Retrieves the main thread from the list.
     
     pub fn main(&mut self) -> &mut ThreadData {
-        assert!(self.data.len() > 0);
+        assert!(!self.data.is_empty());
         for thread in self.data.iter_mut() {
             if thread.thread_id == self.pid {
                 return thread;
@@ -42,7 +44,7 @@ impl ThreadList {
 }
 
 impl Deref for ThreadList {
-    type Target = [ThreadData];
+    type Target = Vec<ThreadData>;
     fn deref(&self) -> &Self::Target {
         &self.data
     }

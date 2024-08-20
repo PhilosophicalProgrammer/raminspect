@@ -6,197 +6,192 @@
 #![allow(non_camel_case_types)]
 use nix::libc::*;
 
-#[cfg(target_arch = "x86_64")]
-#[repr(C)]
+#[doc(hidden)]
+// Used internally to define register structures.
 
-pub struct pt_regs {
-	pub r15: c_ulong,
-	pub r14: c_ulong,
-	pub r13: c_ulong,
-	pub r12: c_ulong,
-	pub rbp: c_ulong,
-	pub rbx: c_ulong,
-	pub r11: c_ulong,
-	pub r10: c_ulong,
-	pub r9: c_ulong,
-	pub r8: c_ulong,
-	pub rax: c_ulong,
-	pub rcx: c_ulong,
-	pub rdx: c_ulong,
-	pub rsi: c_ulong,
-	pub rdi: c_ulong,
-	pub rip: c_ulong,
-	pub cs: c_ulong,
-	pub eflags: c_ulong,
-	pub rsp: c_ulong,
-	pub ss: c_ulong,
+macro_rules! defineregs {
+	($($arch:literal)&&*$(, $align:literal)? {
+		$($regname:ident: $regty:ty),*$(,)?
+	}) => {
+		#[cfg(any($(target_arch = $arch),*))]
+		#[repr(C$(, align($align))?)]
+
+		/// The registers structure for your target architecture. Note that these are general-purpose registers:
+		/// floating-point registers are not included for performance and cross-platform compatibility reasons.
+		/// It corresponds directly with the `pt_regs` struct defined in the Linux kernel source code.
+
+		pub struct pt_regs {
+			$(
+				#[doc = concat!(stringify!($regname), " register.")]
+				pub $regname: $regty,
+			)*
+		}
+	}
 }
 
-#[cfg(target_arch = "x86")]
-#[repr(C)]
+defineregs!("x86_64" {
+	r15: c_ulong,
+	r14: c_ulong,
+	r13: c_ulong,
+	r12: c_ulong,
+	rbp: c_ulong,
+	rbx: c_ulong,
+	r11: c_ulong,
+	r10: c_ulong,
+	r9: c_ulong,
+	r8: c_ulong,
+	rax: c_ulong,
+	rcx: c_ulong,
+	rdx: c_ulong,
+	rsi: c_ulong,
+	rdi: c_ulong,
+	rip: c_ulong,
+	cs: c_ulong,
+	eflags: c_ulong,
+	rsp: c_ulong,
+	ss: c_ulong,
+});
 
-pub struct pt_regs {
-    pub ebx: c_long,
-	pub ecx: c_long,
-	pub edx: c_long,
-	pub esi: c_long,
-	pub edi: c_long,
-	pub ebp: c_long,
-	pub eax: c_long,
-	pub xds: c_int,
-	pub xes: c_int,
-	pub xfs: c_int,
-	pub xgs: c_int,
-	pub orig_eax: c_long,
-	pub eip: c_long,
-	pub xcs: c_int,
-	pub eflags: c_long,
-	pub esp: c_long,
-	pub xss: c_int,
-}
+defineregs!("x86" {
+    ebx: c_long,
+	ecx: c_long,
+	edx: c_long,
+	esi: c_long,
+	edi: c_long,
+	ebp: c_long,
+	eax: c_long,
+	xds: c_int,
+	xes: c_int,
+	xfs: c_int,
+	xgs: c_int,
+	orig_eax: c_long,
+	eip: c_long,
+	xcs: c_int,
+	eflags: c_long,
+	esp: c_long,
+	xss: c_int,
+});
 
-#[cfg(target_arch = "arm")]
+defineregs!("arm" {
+    uregs: [c_ulong; 18]
+});
 
-struct pt_regs {
-    pub uregs: [c_ulong; 18]
-}
+defineregs!("aarch64" {
+    regs: [u64; 31],
+    sp: u64,
+    pc: u64,
+    pstate: u64,
+    orig_x0: u64,
+    syscallno: u64,
+    sdei_ttrb1: u64,
+    pmr_save: u64,
+    stackframe: [u64; 2],
+    lockdep_hardirqs: u64,
+    exit_rcu: u64,
+});
 
-#[cfg(target_arch = "aarch64")]
-#[repr(C)]
-
-struct pt_regs {
-    pub regs: [u64; 31],
-    pub sp: u64,
-    pub pc: u64,
-    pub pstate: u64,
-    pub orig_x0: u64,
-    pub syscallno: u64,
-    pub sdei_ttrb1: u64,
-    pub pmr_save: u64,
-    pub stackframe: [u64; 2],
-    pub lockdep_hardirqs: u64,
-    pub exit_rcu: u64,
-}
-
-#[cfg(target_arch = "csky")]
-#[repr(C)]
-
-struct pt_regs {
-    pub tls: c_ulong,
-	pub lr: c_ulong,
-	pub pc: c_ulong,
-	pub sr: c_ulong,
-	pub usp: c_ulong,
-	pub orig_a0: c_ulong,
-	pub a0: c_ulong,
-	pub a1: c_ulong,
-	pub a2: c_ulong,
-	pub a3: c_ulong,
+defineregs!("csky" {
+    tls: c_ulong,
+	lr: c_ulong,
+	pc: c_ulong,
+	sr: c_ulong,
+	usp: c_ulong,
+	orig_a0: c_ulong,
+	a0: c_ulong,
+	a1: c_ulong,
+	a2: c_ulong,
+	a3: c_ulong,
 
     // We only support `csky` ABI version 2.
-	pub regs: [c_ulong; 10],
-    pub exregs: [c_ulong; 15],
+	regs: [c_ulong; 10],
+    exregs: [c_ulong; 15],
 
-	pub rhi: c_ulong,
-	pub rlo: c_ulong,
-	pub dcsr: c_ulong,
-}
+	rhi: c_ulong,
+	rlo: c_ulong,
+	dcsr: c_ulong,
+});
 
-#[cfg(any(target_arch = "riscv64", target_arch = "riscv32"))]
-#[repr(C)]
+defineregs!("riscv64" && "riscv32" {
+	epc: c_ulong,
+	ra: c_ulong,
+	sp: c_ulong,
+	gp: c_ulong,
+	tp: c_ulong,
+	t0: c_ulong,
+	t1: c_ulong,
+	t2: c_ulong,
+	s0: c_ulong,
+	s1: c_ulong,
+	a0: c_ulong,
+	a1: c_ulong,
+	a2: c_ulong,
+	a3: c_ulong,
+	a4: c_ulong,
+	a5: c_ulong,
+	a6: c_ulong,
+	a7: c_ulong,
+	s2: c_ulong,
+	s3: c_ulong,
+	s4: c_ulong,
+	s5: c_ulong,
+	s6: c_ulong,
+	s7: c_ulong,
+	s8: c_ulong,
+	s9: c_ulong,
+	s10: c_ulong,
+	s11: c_ulong,
+	t3: c_ulong,
+	t4: c_ulong,
+	t5: c_ulong,
+	t6: c_ulong,
+	status: c_ulong,
+	badaddr: c_ulong,
+	cause: c_ulong,
+	orig_a0: c_ulong,
+});
 
-struct pt_regs {
-	pub epc: c_ulong,
-	pub ra: c_ulong,
-	pub sp: c_ulong,
-	pub gp: c_ulong,
-	pub tp: c_ulong,
-	pub t0: c_ulong,
-	pub t1: c_ulong,
-	pub t2: c_ulong,
-	pub s0: c_ulong,
-	pub s1: c_ulong,
-	pub a0: c_ulong,
-	pub a1: c_ulong,
-	pub a2: c_ulong,
-	pub a3: c_ulong,
-	pub a4: c_ulong,
-	pub a5: c_ulong,
-	pub a6: c_ulong,
-	pub a7: c_ulong,
-	pub s2: c_ulong,
-	pub s3: c_ulong,
-	pub s4: c_ulong,
-	pub s5: c_ulong,
-	pub s6: c_ulong,
-	pub s7: c_ulong,
-	pub s8: c_ulong,
-	pub s9: c_ulong,
-	pub s10: c_ulong,
-	pub s11: c_ulong,
-	pub t3: c_ulong,
-	pub t4: c_ulong,
-	pub t5: c_ulong,
-	pub t6: c_ulong,
-	pub status: c_ulong,
-	pub badaddr: c_ulong,
-	pub cause: c_ulong,
-	pub orig_a0: c_ulong,
-}
+defineregs!("sparc" {
+    psr: c_ulong,
+	pc: c_ulong,
+	npc: c_ulong,
+	y: c_ulong,
+	uregs: [c_ulong; 16],
+});
 
-#[cfg(target_arch = "sparc")]
-#[repr(C)]
+defineregs!("sparc64" {
+	uregs: [c_ulong; 16],
+	tstate: c_ulong,
+	tpc: c_ulong,
+	tnpc: c_ulong,
+    y: c_uint,
+    magic: c_uint,
+});
 
-struct pt_regs {
-    pub psr: c_ulong,
-	pub pc: c_ulong,
-	pub npc: c_ulong,
-	pub y: c_ulong,
-	pub uregs: [c_ulong; 16],
-}
+defineregs!("mips64" && "mips64r6", 8 {
+    regs: [c_ulong; 32],
+	cp0_status: c_ulong,
+	hi: c_ulong,
+	lo: c_ulong,
+	cp0_badvaddr: c_ulong,
+	cp0_cause: c_ulong,
+	cp0_epc: c_ulong,
+    __last: [c_ulong; 0],
+});
 
-#[cfg(target_arch = "sparc64")]
-#[repr(C)]
-
-struct pt_regs {
-	pub uregs: [c_ulong; 16],
-	pub tstate: c_ulong,
-	pub tpc: c_ulong,
-	pub tnpc: c_ulong,
-    pub y: c_uint,
-    pub magic: c_uint,
-}
-
-#[cfg(any(target_arch = "mips64", target_arch = "mips64r6"))]
-#[repr(C, align(8))]
-
-struct pt_regs {
-    pub regs: [c_ulong; 32],
-	pub cp0_status: c_ulong,
-	pub hi: c_ulong,
-	pub lo: c_ulong,
-	pub cp0_badvaddr: c_ulong,
-	pub cp0_cause: c_ulong,
-	pub cp0_epc: c_ulong,
-    pub __last: [c_ulong; 0],
-}
-
-#[cfg(any(target_arch = "mips", target_arch = "mips32r6"))]
-#[repr(C, align(8))]
-
-struct pt_regs {
-    pub pad0: [c_ulong; 8],
-    pub regs: [c_ulong; 32],
-	pub cp0_status: c_ulong,
-	pub hi: c_ulong,
-	pub lo: c_ulong,
-	pub cp0_badvaddr: c_ulong,
-	pub cp0_cause: c_ulong,
-	pub cp0_epc: c_ulong,
-    pub __last: [c_ulong; 0],
-}
+defineregs!("mips" && "mips32r6", 8 {
+    pad0: [c_ulong; 8],
+    regs: [c_ulong; 32],
+	cp0_status: c_ulong,
+	hi: c_ulong,
+	lo: c_ulong,
+	cp0_badvaddr: c_ulong,
+	cp0_cause: c_ulong,
+	cp0_epc: c_ulong,
+    __last: [c_ulong; 0],
+});
 
 impl pt_regs {
+	/// Gets the instruction pointer.
     pub fn inst_ptr(&mut self) -> &mut c_ulong {
         #[cfg(target_arch = "x86_64")]
         return &mut self.rip;
@@ -226,6 +221,7 @@ impl pt_regs {
         return &mut self.cp0_epc;
     }
 
+	/// Gets the stack pointer.
     pub fn stack_ptr(&mut self) -> &mut c_ulong {
         #[cfg(target_arch = "x86_64")]
         return &mut self.rsp;
