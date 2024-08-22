@@ -35,22 +35,23 @@ defineregs!("x86_64" {
 	r14: c_ulong,
 	r13: c_ulong,
 	r12: c_ulong,
-	rbp: c_ulong,
-	rbx: c_ulong,
+	bp: c_ulong,
+	bx: c_ulong,
 	r11: c_ulong,
 	r10: c_ulong,
 	r9: c_ulong,
 	r8: c_ulong,
-	rax: c_ulong,
-	rcx: c_ulong,
-	rdx: c_ulong,
-	rsi: c_ulong,
-	rdi: c_ulong,
-	rip: c_ulong,
-	cs: c_ulong,
-	eflags: c_ulong,
-	rsp: c_ulong,
-	ss: c_ulong,
+	ax: c_ulong,
+	cx: c_ulong,
+	dx: c_ulong,
+	si: c_ulong,
+	di: c_ulong,
+	orig_ax: c_ulong,
+	ip: c_ulong,
+	csx: c_ulong,
+	flags: c_ulong,
+	sp: c_ulong,
+	ssx: c_ulong,
 });
 
 defineregs!("x86" {
@@ -195,7 +196,7 @@ impl pt_regs {
 	/// Gets the instruction pointer.
     pub fn inst_ptr(&mut self) -> &mut c_ulong {
         #[cfg(target_arch = "x86_64")]
-        return &mut self.rip;
+        return &mut self.ip;
 
         #[cfg(target_arch = "x86")]
         return &mut self.eip;
@@ -225,7 +226,7 @@ impl pt_regs {
 	/// Gets the stack pointer.
     pub fn stack_ptr(&mut self) -> &mut c_ulong {
         #[cfg(target_arch = "x86_64")]
-        return &mut self.rsp;
+        return &mut self.sp;
 
         #[cfg(target_arch = "x86")]
         return &mut self.esp;

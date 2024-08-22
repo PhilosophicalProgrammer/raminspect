@@ -5,7 +5,6 @@
 use nix::libc::*;
 use nix::ioctl_read;
 use nix::ioctl_readwrite;
-use nix::sys::signal::SigSet;
 
 use super::VmFlags;
 use super::registers::pt_regs;
@@ -18,9 +17,23 @@ use super::registers::pt_regs;
 #[repr(C)]
 #[derive(Clone, Debug)]
 pub struct ThreadData {
+    /// The general-purpose registers of this thread. Note that the floating-point register state is not stored
+    /// in this field. To retrieve or modify that, custom shellcode might be necessary.
     pub registers: pt_regs,
+
+    /// This is the raw signal mask used by the kernel scheduler. Specifically, it is the lower 64 bits of the mask,
+    /// since the actual size is higher on a few architectures, but userspace has no reasonable way to know this
+    /// and rely on it. For that reason, we only expose the most bits that we can safely expose across
+    /// architectures, which happens to be 64 bits.
+    ///
+    /// It is distinct from the typical `sigset_t` type provided by `libc`, as it is simply a bitmask of signal numbers
+    /// rather than an array of integers. The bit that represents a signal is located at `(1 << SIGNUM)`, where `SIGNUM`
+    /// is the `libc` constant that corresponds to the signal that you want to modify. To mask `SIGCONT`, for example,
+    /// you could write the following: `sigmask &= ~(1 << SIGCONT)`
+    pub sigmask: u64,
+
+    /// The thread ID of the thread, which is the same as the process ID of the parent process if it's the main thread.
     pub thread_id: pid_t,
-    pub sigmask: SigSet,
 }
 
 /// This is used in the `*_THREADS` ioctls. It contains a buffer of `thread_data` structures, the

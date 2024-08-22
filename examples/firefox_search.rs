@@ -2,8 +2,8 @@
 //! "Old search text" to "New search text". To run this example, open an instance
 //! of Firefox and type "Old search text" in the search bar. If all goes well, when
 //! you run this example as root, it should be replaced with "New search text",
-//! although you may have to click on the search bar again in order for it to
-//! render the new text.
+//! although you may have to switch tabs and then switch back for it to render
+//! the new text.
 
 use raminspect::Result;
 use raminspect::RamInspector;

@@ -29,8 +29,22 @@
 // information about the signal mask and registers of the target thread.
 
 struct thread_data {
+    // The general-purpose registers of this thread. Note that the floating-point register state is not stored
+    // in this field. To retrieve or modify that, custom shellcode might be necessary.
     struct pt_regs registers;
-    sigset_t sigmask;
+
+    // This is the raw signal mask used by the kernel scheduler. Specifically, it is the lower 64 bits of the mask,
+    // since the actual size is higher on a few architectures, but userspace has no reasonable way to know this
+    // and rely on it. For that reason, we only expose the most bits that we can safely expose across
+    // architectures, which happens to be 64 bits.
+    //
+    // It is distinct from the typical `sigset_t` type provided by `libc`, as it is simply a bitmask of signal numbers
+    // rather than an array of integers. The bit that represents a signal is located at `(1 << SIGNUM)`, where `SIGNUM`
+    // is the `libc` constant that corresponds to the signal that you want to modify. To mask `SIGCONT`, for example,
+    // you could write the following: `sigmask &= ~(1 << SIGCONT)`
+    uint64_t sigmask;
+
+    // The thread ID of the thread, which is the same as the process ID of the parent process if it's the main thread.
     pid_t thread_id;
 };
 
@@ -115,7 +129,7 @@ static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long 
                     task_lock(thread);
                     buffer[copy_count++] = (struct thread_data){
                         .registers = *task_pt_regs(thread),
-                        .sigmask = thread->blocked,
+                        .sigmask = *(uint64_t*)(&thread->blocked),
                         .thread_id = thread->pid
                     };
 
@@ -152,7 +166,7 @@ static long raminspect_ioctl(struct file *fptr, unsigned int cmd, unsigned long 
 
                         if(thread->pid == curr_thread.thread_id) {
                             task_lock(thread);
-                            thread->blocked = curr_thread.sigmask;
+                            *(uint64_t*)(&thread->blocked) = curr_thread.sigmask;
                             *task_pt_regs(thread) = curr_thread.registers;
                             task_unlock(thread);
                             break;

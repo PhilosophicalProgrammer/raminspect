@@ -29,12 +29,10 @@ fn exit_err(msg: &str) -> ! {
 }
 
 fn main() {
-    let mut args = std::env::args();
-    let pid_parse_err = "Expected a number as the first argument";
+    // We always skip the first argument, which is the program name on Unix systems
+    let mut args = std::env::args().skip(1);
 
-    // Skip the first argument which is the program name on Unix systems
-    args.next();
-    
+    let pid_parse_err = "Expected a number as the first argument";
     let pid = args.next().unwrap_or_else(|| exit_err(pid_parse_err)).parse::<i32>().unwrap_or_else(|_| {
         exit_err(pid_parse_err)
     });

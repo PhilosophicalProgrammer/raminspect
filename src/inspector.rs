@@ -319,7 +319,7 @@ impl RamInspector {
 
                 // We disable all of the signal handlers for the duration of shellcode execution, in order to avoid crashes and instability
                 // caused by interruptions. Most importantly, this masks `SIGCONT`, which helps us avoid detection.
-                thread.sigmask = SigSet::empty();
+                thread.sigmask = 0;
             }
 
             // Read out the old instructions.
