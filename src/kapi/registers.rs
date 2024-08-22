@@ -15,6 +15,7 @@ macro_rules! defineregs {
 	}) => {
 		#[cfg(any($(target_arch = $arch),*))]
 		#[repr(C$(, align($align))?)]
+		#[derive(Clone, Debug)]
 
 		/// The registers structure for your target architecture. Note that these are general-purpose registers:
 		/// floating-point registers are not included for performance and cross-platform compatibility reasons.

@@ -16,6 +16,7 @@ use super::registers::pt_regs;
 /// information about the signal mask and registers of the target thread.
 
 #[repr(C)]
+#[derive(Clone, Debug)]
 pub struct ThreadData {
     pub registers: pt_regs,
     pub thread_id: pid_t,

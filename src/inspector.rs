@@ -1,18 +1,27 @@
 //! This provides the structure that represents the interface of the library, [`RamInspector`]. See its
 //! documentation for more information.
 
-use either::Either;
 use std::io::IoSlice;
 use std::io::IoSliceMut;
 
+use std::cell::OnceCell;
+use std::sync::atomic::Ordering;
+use std::sync::atomic::AtomicBool;
+
 use nix::libc;
+use nix::errno::Errno;
+
 use nix::unistd::Pid;
+use nix::unistd::sleep;
 use nix::unistd::getpgid;
 use nix::unistd::sysconf;
 use nix::unistd::SysconfVar;
+
 use nix::sys::signal::killpg;
+use nix::sys::signal::SigSet;
 use nix::sys::signal::SIGSTOP;
 use nix::sys::signal::SIGCONT;
+use nix::sys::signal::SIGUSR1;
 use nix::sys::uio::RemoteIoVec;
 use nix::sys::uio::process_vm_readv;
 use nix::sys::uio::process_vm_writev;
@@ -22,8 +31,12 @@ use procfs::process::Process;
 
 use crate::error::Result;
 use crate::kapi::RawInspector;
-use crate::region::MemoryRegion;
 use crate::error::RamInspectError as Error;
+ 
+use crate::region::VmFlags;
+use crate::region::MemoryRegion;
+
+// TODO: Add signal handler.
 
 /// This is the primary interface used by the crate to search through, read, and modify an
 /// arbitrary processes' memory, registers, and code. All uses of this library must either
@@ -71,14 +84,62 @@ use crate::error::RamInspectError as Error;
 pub struct RamInspector {
     proc: Process,
     max_iovs: usize,
-    process_paused: bool,
+    process_paused: AtomicBool,
 
     // Lazily initialized so that we don't require the kernel module to be loaded for functions that don't need it.
-    kapi: Option<RawInspector>,
+    kapi: OnceCell<Result<RawInspector>>,
 }
 
-/// See [`RamInspector::bulk_iov_op`].
-type ReadOrWrites<'a> = Either<Vec<(usize, &'a mut [u8])>, Vec<(usize, &'a [u8])>>; 
+/// Used internally to define [`RamInspector::read_bulk`] and [`RamInspector::write_bulk`]. The common logic for reading and
+/// writing buffers paired with addresses via `iovec`s is extracted to this macro.
+
+macro_rules! define_iov_op {
+    ($(#[$doc:meta])* $fname:ident<$bufty:ty, $slicety:ty, $sysfunc:ident, $errvariant:ident> $($unsafe:tt)?) => {
+        $(#[$doc])*
+        pub $($unsafe)? fn $fname<'a, O: Iterator<Item = (usize, $bufty)>>(&self, ops: O) -> Result<()> {
+            let (remotes, mut iovs): (Vec<_>, Vec<_>) = ops.map(|(base, buf)| (
+                RemoteIoVec {
+                    base,
+                    len: buf.len()
+                },
+
+                <$slicety>::new(buf)
+            )).unzip();
+
+            let mut i = 0;
+            while i < iovs.len() {
+                let end_index = (i + self.max_iovs).min(iovs.len());
+                let mut total_copied = 0;
+
+                // We keep attempting to copy until the full amount was read or written. If zero bytes were copied in an iteration
+                // of this loop, then we return early with `Error::Partial`.
+
+                'copy: while i < end_index {
+                    let pid = Pid::from_raw(self.proc.pid);
+                    let amount_copied = $sysfunc(pid, &mut iovs[i..end_index], &remotes[i..end_index]).map_err(|_| Error::$errvariant)?;
+
+                    total_copied += amount_copied;
+                    if amount_copied == 0 { return Err(Error::Partial(total_copied)); }
+
+                    // Check if the full amount was copied.
+                    let mut expected_amount = 0;
+
+                    while i < end_index {
+                        expected_amount += iovs[i].len();
+                        if expected_amount > amount_copied {
+                            // Try again starting from this index if less than the expected amount was copied.
+                            continue 'copy;
+                        }
+
+                        i += 1;
+                    }
+                }
+            }
+
+            Ok(())
+        }
+    }
+}
 
 impl RamInspector {
     /// Creates a new inspector attached to the specified process ID. Note: You should probably pause the
@@ -87,10 +148,10 @@ impl RamInspector {
     
     pub fn new(pid: pid_t) -> Result<Self> {
         Ok(Self {
-            kapi: None,
-            process_paused: false,
-            proc: Process::new(pid)?,
-            max_iovs: sysconf(SysconfVar::IOV_MAX)?.ok_or(Error::SysconfFailed)? as usize
+            kapi: OnceCell::new(),
+            process_paused: AtomicBool::new(false),
+            proc: Process::new(pid).map_err(|_| Error::FailedToAccessProcess)?,
+            max_iovs: sysconf(SysconfVar::IOV_MAX)?.ok_or(Error::SysconfFailed)? as usize,
         })
     }
 
@@ -119,25 +180,25 @@ impl RamInspector {
     /// });
     /// ```
     
-    pub fn do_while_paused<F: FnMut(&mut RamInspector) -> Result<()>>(&mut self, mut callback: F) -> Result<()> {
-        if self.process_paused {
+    pub fn do_while_paused<F: FnMut() -> Result<()>>(&self, mut callback: F) -> Result<()> {
+        if self.process_paused.load(Ordering::SeqCst) {
             // If we're already paused, call the callback right away.
-            return callback(self);
+            return callback();
         }
 
-        self.process_paused = true;
+        self.process_paused.store(true, Ordering::SeqCst);
         // We wrap this within its own context so that we can still set `process_paused` to false on error.
 
         let res = (|| {
             let pid = Pid::from_raw(self.proc.pid);
             let pgid = getpgid(Some(pid))?;
             killpg(pgid, SIGSTOP)?;
-            callback(self)?;
+            callback()?;
             killpg(pgid, SIGCONT)?;
             Ok(())
         })();
 
-        self.process_paused = false;
+        self.process_paused.store(false, Ordering::SeqCst);
         res
     }
 
@@ -149,39 +210,238 @@ impl RamInspector {
     /// Note: Before using the kernel API, you should consider if the higher-level API suits your use case,
     /// since it is both simpler and safer to use.
     
-    pub fn kernapi(&mut self) -> Result<&RawInspector> {
-        if self.kapi.is_some() {
-            Ok(self.kapi.as_ref().unwrap())
-        } else {
-            self.kapi = Some(RawInspector::new(self.proc.pid)?);
-            self.kernapi()
+    pub fn kernapi(&self) -> Result<&RawInspector> {
+        match self.kapi.get_or_init(|| RawInspector::new(self.proc.pid)) {
+            Ok(kapi) => Ok(kapi),
+            Err(e) => Err(*e)
         }
     }
 
     /// Allows for the execution of arbitrary code in the context of the process. The
     /// provided code should be completely position independent, since it could be
-    /// loaded anywhere.
+    /// loaded anywhere. This requires the kernel module to be loaded to work.
+    /// 
+    /// You must provide a `pid_cookie` argument, which is a magic 64-bit number stored 
+    /// in your shellcode which will be replaced with the process ID of the injector
+    /// prior to when the shellcode is inserted. Make this variable global and volatile
+    /// to prevent compiler optimizaations from messing with the process. Additionally,
+    /// to reduce the risk of multiple occurences of this in your binary, make this a
+    /// random number.
+    /// 
+    /// This process ID will be used to send a signal to the injector (specifically,
+    /// `SIGUSR1`) which will notify the injector that the shellcode has finished
+    /// executing. Upon receiving this signal, the injector will pause the proces
+    /// and restore the old state of execution prior to injection.
+    /// 
+    /// All other threads than the main thread of the target process will be halted until
+    /// this signal is received, in order to ensure that only the shellcode you provide
+    /// is executing in the processes' context for the duration of injection, and nothing
+    /// else. If you want to run it asynchronously with the rest of the process past the
+    /// return point of this function, create a thread from within your shellcode, and
+    /// then send the signal after it spawns.
+    /// 
+    /// There is a one second timeout until this function gives up on waiting for said
+    /// signal and returns [`Error::ExecTimeout`]. If you need more time than that to
+    /// do processing, then follow the same procedure as above and create a thread.
+    /// 
+    /// It is not recommended to pause all threads of a process for too long regardless,
+    /// since it could interfere with timing-based system calls and persistent network
+    /// connections if the application is network-facing. Asynchronous execution is
+    /// essentially a requirement if you need time in these situations.
+    /// 
+    /// The callback argument is used after the signal is received but before the process
+    /// is paused, and the actual address where the shellcode was inserted into the process
+    /// is provided as an argument to the callback. This can allow you to directly extract
+    /// information from your shellcode after it's done executing by inspecting its memory,
+    /// which is generally much faster than the alternative (file I/O). Note that callback`
+    /// will never be called if an error occurs before then.
+    /// 
+    /// # Notice
+    /// 
+    /// The old instructions prior to injection and the general-purpose registers of every thread
+    /// are saved and restored for you by this function, but the restoration of floating point
+    /// registers and the stack has to be performed manually. Make sure that your shellcode
+    /// does this if it modifies either of those things, unless you intentionally want the
+    /// modifications to persist.
     /// 
     /// # Safety
     /// 
     /// This is unsafe because there are no checks in place to ensure the provided code is safe,
-    /// and in fact such checks would be impossible to implement (cc. halting problem). Use
-    /// with caution.
+    /// and in fact such checks would be impossible to implement universally due to the
+    /// halting problem. Use with caution.
+    /// 
+    /// # Example Usage
+    /// 
+    /// ```rust
+    /// use raminspect::RamInspector;
+    /// const YOUR_PID_COOKIE: u64 = 0xDEADBEEFCAFEBABE;
+    /// let inspector = RamInspector::new(1234); // Replace 1234 with your target PID
+    /// inspector.execute_shellcode(include_bytes!("path/to/your/shellcode.bin"), YOUR_PID_COOKIE, |ip| {
+    ///     println!("Finished executing! Shellcode was inserted at virtual address: 0x{:X}", ip); 
+    /// })?;
+    /// ```
     
-    pub unsafe fn execute_shellcode(&mut self, _shellcode: &[u8]) -> Result<()> {
-        Ok(())
+    pub unsafe fn execute_shellcode<F: FnMut(usize) -> Result<()>>(&self, shellcode: &mut [u8], pid_cookie: u64, mut callback: F) -> Result<()> {
+        let pid_loc = (0..shellcode.len()).find(|i| {
+            shellcode[*i..].starts_with(&pid_cookie.to_ne_bytes())
+        }).ok_or(Error::CookieNotFound)?;
+
+        // Provide the our process ID to the shellcode.
+        shellcode[pid_loc..pid_loc + core::mem::size_of::<u64>()].copy_from_slice(&(Pid::this().as_raw() as u64).to_ne_bytes());
+
+        let mut main_ip = None;
+        let mut old_threads = None;
+        let kapi = self.kernapi()?;
+
+        // Retrieve the current list of executable memory regions.
+        let mut exec_regions = self.regions()?.filter(|region| region.executable()).collect::<Vec<_>>();
+
+        // Address / data pairs of the instructions at the instruction pointers of threads that we will modify.
+        // This is used to restore the old instructions after our injected shellcode finishes executing.
+        let mut old_instructions = Vec::new();
+
+        // This is used to restore the old access privileges of regions that we modified the memory protection of.
+        let mut old_regions = Vec::new();
+
+        // Inject the shellcode.
+        self.do_while_paused(|| {
+            // Get the current thread states.
+            let mut threads = kapi.get_threads()?;
+
+            // Store a copy of the original thread states for later restoration. 
+            old_threads = Some(threads.clone());
+
+            // Create read / write queues.
+            let mut reads = Vec::with_capacity(threads.len());
+            let mut writes = Vec::with_capacity(threads.len());
+
+            for thread in threads.iter_mut() {
+                // Make the memory region containing the threads' instruction pointer writable so that we can modify it.
+                let ip = *thread.registers.inst_ptr() as usize;
+
+                // This is guaranteed to exist, so it's safe to unwrap here.
+                let ip_region = exec_regions.iter_mut().find(|region| region.addr_range().contains(&ip)).unwrap();
+                old_regions.push(ip_region.clone());
+                kapi.set_vma_flags(ip_region, ip_region.flags() | VmFlags::WR)?;
+
+                let code_to_inject = if thread.thread_id == self.proc.pid {
+                    // We're in the main thread. We'll copy the shellcode over and set `main_ip` to the fetched instruction pointer to be
+                    // sent to the callback later.
+                    main_ip = Some(ip);
+                    &*shellcode
+                } else {
+                    // We inject an infinite loop into the threads other than the main one as a way to halt their execution
+                    // while the shellcode is running in the main thread. See `injected-c/src/forever.c`
+                    include_bytes!("../injected-c/build/forever.bin")
+                };
+
+                reads.push((ip, vec![0; code_to_inject.len()]));
+                writes.push((ip, code_to_inject));
+
+                // We disable all of the signal handlers for the duration of shellcode execution, in order to avoid crashes and instability
+                // caused by interruptions. Most importantly, this masks `SIGCONT`, which helps us avoid detection.
+                thread.sigmask = SigSet::empty();
+            }
+
+            // Read out the old instructions.
+            self.read_bulk(reads.iter_mut().map(|(addr, buf)| (*addr, buf.as_mut_slice())))?;
+            old_instructions = reads;
+
+            // Write in the new instructions.
+            self.write_bulk(writes.into_iter())?;
+            Ok(())
+        })?;
+
+        // By now, the shellcode is executing.
+        let mut set = SigSet::empty();
+        set.add(SIGUSR1);
+
+        // Mask all signals other than `SIGUSR1` in this thread.
+        let old_mask = SigSet::thread_get_mask()?;
+        set.thread_set_mask()?;
+
+        // This call to sleep will end prematurely and set `errno` to `EINTR` when a signal is received. If a signal is
+        // not received, it will act as a timeout and we will return `ExecTimeout` when the post-execution cleanup
+        // finishes.
+        sleep(1);
+
+        // Restore the old signal mask.
+        old_mask.thread_set_mask()?;
+
+        let retval = if Errno::last() != Errno::EINTR {
+            // We delay returning an error so that we can perform still perform cleanup afterwards.
+            Err(Error::ExecTimeout)
+        } else {
+            // Safe to unwrap here since it's guaranteed to be set by now.
+            callback(main_ip.unwrap())?;
+            Ok(())
+        };
+
+        // Perform cleanup.
+        self.do_while_paused(|| {
+            // Restore the old registers and signal masks.
+            kapi.set_threads(old_threads.as_ref().unwrap())?;
+
+            // Restore the old instructions.
+            self.write_bulk(old_instructions.iter().map(|(addr, buf)| (*addr, buf.as_slice())))?;
+
+            for region in old_regions.iter_mut() {
+                // Restore the old memory access privileges.
+                kapi.set_vma_flags(region, region.flags())?;
+            }
+
+            Ok(())
+        })?;
+
+        // By now the original program code should be running again.
+        retval
     }
 
     /// Allocates a new buffer with the given size for the current process and returns the address
-    /// of it. Currently this only works on x86-64, but PRs to expand it to work on other CPU
-    /// architectures are welcome.
+    /// of it. This requires the kernel module to be loaded.
     /// 
-    /// Note that due to the way this is implemented this function is fairly expensive. Don't use this many 
+    /// Note that due to the way this is implemented this function is very expensive. Don't use this many 
     /// times in a hot loop; try to make a few big allocations instead of many small ones for better 
-    /// performance.
+    /// performance. Ideally you should only use it once to create a scratch memory area, and then
+    /// wrap a custom allocator around this pre-allocated buffer.
+    /// 
+    /// # Safety
+    /// 
+    /// This uses library-provided shellcode to allocate the memory internally. Injecting code into a
+    /// process is a fundamentally memory-unsafe operation. It shouldn't fail or cause crashes under
+    /// regular circumstances, but keep this in mind when using this function.
     
-    pub fn allocate_buffer(&mut self, _size: usize) -> Result<usize> {
-        unimplemented!()
+    pub unsafe fn allocate_buffer(&self, size: usize) -> Result<usize> {
+        // These "cookies" are magic numbers precompiled into the shellcode that we either find and replace
+        // with an input value or read a value out of after the shellcode finishes executing. They are
+        // vectors of communication with the shellcode, through which we can write data out and read
+        // data in. Their starting values are arbitrary and randomly generated to reduce the risk
+        // that they would occur multiple times within the final binary. For details on what these
+        // cookies represent, see `injected-c/src/allocmem.c`.
+        const SIZE_COOKIE: u64 = 0xF0CCF6B495854508;
+        const ADDR_COOKIE: u64 = 0xBFB04CDC2D0AB7B8;
+        const PID_COOKIE: u64 = 0xBE05253FF57ECE7F;
+
+        let mut shellcode = *include_bytes!("../injected-c/build/allocmem.bin");
+        let cookie_loc = |cookie: &[u8]| (0..shellcode.len()).find(|i| shellcode[*i..].starts_with(cookie)).unwrap();
+
+        let size_loc = cookie_loc(&SIZE_COOKIE.to_ne_bytes());
+        let addr_loc = cookie_loc(&ADDR_COOKIE.to_ne_bytes());
+        shellcode[size_loc..size_loc + core::mem::size_of::<usize>()].copy_from_slice(&size.to_ne_bytes());
+
+        let mut out_addr = -1;
+        let mut out = vec![0; shellcode.len()];
+        self.execute_shellcode(&mut shellcode, PID_COOKIE, |ip| {
+            self.read_address(ip, &mut out)?;
+            out_addr = isize::from_ne_bytes(out[addr_loc..addr_loc + core::mem::size_of::<isize>()].try_into().unwrap());
+            Ok(())
+        })?;
+
+        if out_addr < 0 && out_addr > i32::MIN as _ {
+            Err(Error::AllocFailed(Errno::from_raw(out_addr as i32)))
+        } else {
+            Ok(out_addr as usize) 
+        }
     }
 
     /// Fills the output buffer with memory read starting from the target address. This can fail
@@ -195,8 +455,8 @@ impl RamInspector {
     /// this function, which very significantly reduces the amount of syscalls needed to
     /// perform the read operation.
     
-    pub fn read_address(&self, addr: usize, out_buf: &mut [u8]) -> Result<()> {
-        self.read_bulk(vec![(addr, out_buf)])
+    pub fn read_address(&self, addr: usize, buf: &mut [u8]) -> Result<()> {
+        self.read_bulk([(addr, buf)].into_iter())
     }
 
     /// A convenience function that reads the specified amount of bytes from the target address
@@ -226,93 +486,38 @@ impl RamInspector {
     /// This is unsafe since directly writing to an arbitrary address in an arbitrary processes' 
     /// memory is not memory safe at all; it is assumed that the caller knows what they're doing.
     
-    pub unsafe fn write_to_address(&self, addr: usize, in_buf: &[u8]) -> Result<()> {
-        self.write_bulk(vec![(addr, in_buf)])
+    pub unsafe fn write_to_address(&self, addr: usize, buf: &[u8]) -> Result<()> {
+        self.write_bulk([(addr, buf)].into_iter())
     }
-
-    /// Used internally to simplify bulk reads and writes of data that use iovecs
     
-    unsafe fn bulk_iov_op(&self, ops: ReadOrWrites) -> Result<()> {
-        let remotes: Vec<RemoteIoVec> = either::for_both!(ops.as_ref(), ops => ops.iter().map(|(base, buf)| RemoteIoVec {
-            base: *base,
-            len: buf.len()
-        }).collect());
-
-        let mut io_slices: Either<Vec<IoSliceMut>, Vec<IoSlice>> = ops.map_either(
-            |s| s.into_iter().map(|(_, buf)| IoSliceMut::new(buf)).collect(),
-            |s| s.into_iter().map(|(_, buf)| IoSlice::new(buf)).collect(),
-        );
-
-        let blen = either::for_both!(io_slices.as_ref(), s => s.len());
-        assert_eq!(remotes.len(), blen);
-
-        let mut i = 0;
-        while i < blen {
-            let end_index = (i + self.max_iovs).min(blen);
-            let mut total_copied = 0;
-
-            // We keep attempting to copy until the full amount was read or written. If zero bytes were copied in this loop,
-            // then we return early with `Error::Partial`.
-
-            'copy: while i < end_index {
-                let pid = Pid::from_raw(self.proc.pid);
-                let amount_copied = match io_slices.as_mut() {
-                    Either::Left(read) => process_vm_readv(pid, &mut read[i..end_index], &remotes[i..end_index]).map_err(|_| Error::FailedToReadMem)?,
-                    Either::Right(write) => process_vm_writev(pid, &write[i..end_index], &remotes[i..end_index]).map_err(|_| Error::FailedToWriteMem)?,
-                };
-
-                total_copied += amount_copied;
-                if amount_copied == 0 { return Err(Error::Partial(total_copied)); }
-
-                // Check if the full amount was copied.
-                let mut expected_amount = 0;
-
-                while i < end_index {
-                    expected_amount += either::for_both!(io_slices.as_ref(), s => s[i].len());
-
-                    if expected_amount > amount_copied {
-                        // Try again starting from this index if less than the expected amount was copied.
-                        continue 'copy;
-                    }
-
-                    i += 1;
-                }
-            }
-        }
-
-        Ok(())
+    define_iov_op! {
+        /// Performs many memory reads at once in one I/O syscall, taking in an iterator of address / output
+        /// buffer pairs as an argument. This can be much faster than [`RamInspector::read_address`] if 
+        /// you're making many reads, and should be preferred in that case. This has the same failure
+        /// conditions as `read_address`.
+        
+        read_bulk<&'a mut [u8], IoSliceMut, process_vm_readv, FailedToReadMem>
     }
 
-    /// Performs many memory reads at once in one I/O syscall, taking in an iterator of address / output
-    /// buffer pairs as an argument. This can be much faster than [`RamInspector::read_address`] if 
-    /// you're making many reads, and should be preferred in that case. This has the same failure
-    /// conditions as `read_address`.
     
-    pub fn read_bulk(&self, reads: Vec<(usize, &mut [u8])>) -> Result<()> {
-        unsafe {
-            // Reading memory from a process shouldn't be unsafe unless it's MMIO, but this is generally not exposed to userspace.
-            self.bulk_iov_op(Either::Left(reads))
-        }
-    }
-
-    /// Write-side counterpart of [`RamInspector::read_bulk`]. Like `read_bulk`, this can be significantly
-    /// faster than the single-operation counterpart if you're moving multiple pieces of data, and should
-    /// be preferred in that case.
-    /// 
-    /// # Safety
-    /// 
-    /// This has the same failure conditions and safety concerns as [`RamInspector::write_to_address`].
-    /// See its documentation for more information.
-
-    pub unsafe fn write_bulk(&self, writes: Vec<(usize, &[u8])>) -> Result<()> {
-        self.bulk_iov_op(Either::Right(writes))
+    define_iov_op! {
+        /// Write-side counterpart of [`RamInspector::read_bulk`]. Like `read_bulk`, this can be significantly
+        /// faster than the single-operation counterpart if you're moving multiple pieces of data, and should
+        /// be preferred in that case.
+        /// 
+        /// # Safety
+        /// 
+        /// This has the same failure conditions and safety concerns as [`RamInspector::write_to_address`].
+        /// See its documentation for more information.
+        
+        write_bulk<&'a [u8], IoSlice, process_vm_writev, FailedToWriteMem> unsafe
     }
 
     /// A function that returns an iterator over the target processes' memory regions, generated by reading its
     /// `/proc/maps` and `/proc/smaps` files. See the documentation of [`MemoryRegion`] for more information.
     
-    pub fn regions(&mut self) -> Result<impl Iterator<Item = MemoryRegion>> {
-        Ok(self.proc.maps()?.into_iter().map(|mmap| MemoryRegion {
+    pub fn regions(&self) -> Result<impl Iterator<Item = MemoryRegion>> {
+        Ok(self.proc.maps().map_err(|_| Error::FailedToGetMaps)?.into_iter().map(|mmap| MemoryRegion {
             inner: mmap
         }))
     }
@@ -322,7 +527,7 @@ impl RamInspector {
     /// This will fail if the process terminated unexpectedly, but it should succeed in 
     /// basically any other case.
     
-    pub fn search_for_term(&mut self, search_term: &[u8]) -> Result<Vec<(usize, MemoryRegion)>> {
+    pub fn search_for_term(&self, search_term: &[u8]) -> Result<Vec<(usize, MemoryRegion)>> {
         if search_term.is_empty() {
             return Ok(Vec::new());
         }

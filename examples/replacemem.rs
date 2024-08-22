@@ -17,7 +17,10 @@
 //! 
 //! And then use the resulting executable like this after you refresh your shell:
 //! 
-//! `replacemem <pid> <string search term> <string replacement>`
+//! `sudo replacemem <pid> <string search term> <string replacement>`
+
+use raminspect::Result;
+use raminspect::RamInspector;
 
 fn exit_err(msg: &str) -> ! {
     eprintln!("Error: {}", msg);
@@ -26,7 +29,6 @@ fn exit_err(msg: &str) -> ! {
 }
 
 fn main() {
-    use raminspect::RamInspector;
     let mut args = std::env::args();
     let pid_parse_err = "Expected a number as the first argument";
 
@@ -44,22 +46,19 @@ fn main() {
         exit_err("Expected no more than three arguments.");
     }
 
-    use raminspect::RamInspectError;
-    fn inspect_process(pid: i32, search_term: &str, replacement_term: &str) -> Result<(), RamInspectError> {
-        unsafe {
-            let mut inspector = RamInspector::new(pid)?;
-            for (result_addr, memory_region) in inspector.search_for_term(search_term.as_bytes())? {
-                if !memory_region.writable() {
-                    continue;
-                }
-
-                println!("Writing to address: 0x{:X}", result_addr);
-                inspector.queue_write(result_addr, replacement_term.as_bytes());
+    fn inspect_process(pid: i32, search_term: &str, replacement_term: &str) -> Result<()> {
+        let mut writes = Vec::new();
+        let inspector = RamInspector::new(pid)?;
+        for (result_addr, memory_region) in inspector.search_for_term(search_term.as_bytes())? {
+            if !memory_region.writable() {
+                continue;
             }
-            
-            inspector.flush().unwrap();
-        }
 
+            println!("Writing to address: 0x{:X}", result_addr);
+            writes.push((result_addr, replacement_term.as_bytes()));
+        }
+        
+        unsafe { inspector.write_bulk(writes.into_iter())? }
         Ok(())
     }
 

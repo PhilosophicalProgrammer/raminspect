@@ -7,21 +7,22 @@ use std::fmt::Formatter;
 
 use std::process::ExitCode;
 use std::process::Termination;
-
 use nix::errno::Errno;
-use procfs::ProcError;
 
 /// This can represent any possible error returned by this library's functions. It is not
 /// intended to be used directly by users. Instead, you should use the [`Result`] type
 /// provided by this module.
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum RamInspectError {
     /// Root permissions are necessary to use the kernel API.
     NoRootPerms,
 
     /// The `raminspect` device file could not be opened.
     FailedToOpenDevice,
+
+    /// A handle to the requested PID could not be retrieved.
+    FailedToAccessProcess,
 
     /// The requested resource was not found.
     NotFound,
@@ -41,14 +42,23 @@ pub enum RamInspectError {
     /// Failed to write memory.
     FailedToWriteMem,
 
+    /// Failed to open process maps.
+    FailedToGetMaps,
+
+    /// The execution of the shellcode timed out (i.e. no signal was received within a second).
+    ExecTimeout,
+
+    /// The provided PID cookie couldn't be found.
+    CookieNotFound,
+
+    /// The shellcode injected by `allocate_memory` returned an error.
+    AllocFailed(Errno),
+
     /// The requested operation only completed partially.
     Partial(usize),
 
     /// `nix` returned an unknown error.
     Errno(Errno),
-
-    /// `procfs` returned an error.
-    ProcFs(ProcError)
 }
 
 impl RamInspectError {
@@ -70,18 +80,13 @@ impl From<Errno> for RamInspectError {
     }
 }
 
-impl From<ProcError> for RamInspectError {
-    fn from(perr: ProcError) -> Self {
-        Self::ProcFs(perr)
-    }
-}
-
 impl Display for RamInspectError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             // Initialization errors.
             RamInspectError::NoRootPerms => "Root privileges are required in order to use the kernel-level interface. This is by design.",
             RamInspectError::FailedToOpenDevice => "Failed to open `/dev/raminspect`. Are you sure that the kernel module is loaded?",
+            RamInspectError::FailedToAccessProcess => "Failed to create a handle to the requested PID.",
             RamInspectError::SysconfFailed => "Failed to retrieve `max_iovs` from `sysconf`.",
 
             // Kernel module errors.
@@ -94,12 +99,17 @@ impl Display for RamInspectError {
 
             // Memory reading / writing errors.
             RamInspectError::Partial(n) => return write!(formatter, "The requested operation only completed partially: {} bytes were read or written", n),
+            RamInspectError::FailedToGetMaps => "Failed to access the memory maps for the target process.",
             RamInspectError::FailedToWriteMem => "Failed to write to the specified address.",
             RamInspectError::FailedToReadMem => "Failed to read the specified address.",
 
-            // Crate-specific errors from either `nix` or `procfs`
+            // Shellcode execution errors.
+            RamInspectError::ExecTimeout => "The execution of the provided shellcode timed out. Are you sure you're sending `SIGUSR1` to the injector when it finishes?",
+            RamInspectError::AllocFailed(errno) => return write!(formatter, "The `mmap` syscall failed with this error code while allocating: {}", errno),
+            RamInspectError::CookieNotFound => "The provided PID cookie could not be found in the provided shellcode.",
+
+            // Crate-specific errors from `nix`
             RamInspectError::Errno(errno) => return Display::fmt(errno, formatter),
-            RamInspectError::ProcFs(perr) => return Display::fmt(perr, formatter)
         })
     }
 }

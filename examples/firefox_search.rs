@@ -5,32 +5,36 @@
 //! although you may have to click on the search bar again in order for it to
 //! render the new text.
 
-fn main() {
-    use raminspect::RamInspector;
+use raminspect::Result;
+use raminspect::RamInspector;
+
+fn main() -> Result<()> {
     // Iterate over all running Firefox instances
-    for pid in raminspect::find_processes("/usr/lib/firefox") {
-        let mut inspector = match RamInspector::new(pid) {
+    for proc in raminspect::find_processes("/usr/lib/firefox") {
+        let inspector = match RamInspector::new(proc.pid) {
             Ok(inspector) => inspector,
             Err(_) => continue,
         };
-        
-        for (proc_addr, memory_region) in inspector.search_for_term(b"Old search text").unwrap() {
-            if !memory_region.writable() {
-                continue;
-            }
 
-            unsafe {
-                // This is safe because modifying the text in the Firefox search bar will not crash
-                // the browser or negatively impact system stability in any way.
+        // We have to make sure we're paused here since we're making modifications.
 
+        inspector.do_while_paused(|| {
+            let mut writes = Vec::new();
+            for (proc_addr, memory_region) in inspector.search_for_term(b"Old search text")? {
+                if !memory_region.writable() {
+                    continue;
+                }
+    
                 println!("Writing to process virtual address: 0x{:X}", proc_addr);
-                inspector.queue_write(proc_addr, b"New search text");
+                writes.push((proc_addr, b"New search text".as_slice()));
             }
-        }
-
-        unsafe {
-            // This is safe since the process is not currently resumed, which would possibly cause a data race.
-            inspector.flush().unwrap();
-        }
+    
+            // This is safe because modifying the text in the Firefox search bar will not crash
+            // the browser or negatively impact system stability in any way.
+            unsafe { inspector.write_bulk(writes.into_iter())? }
+            Ok(())
+        })?;
     }
+
+    Ok(())
 }

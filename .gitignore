@@ -3,6 +3,7 @@
 /.vscode
 *.ko
 *.o
+*.bin
 *.mod
 *.mod.c
 *.order

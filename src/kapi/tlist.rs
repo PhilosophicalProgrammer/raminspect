@@ -14,6 +14,7 @@ use nix::libc::pid_t;
 /// calling [`RawInspector::get_threads`], and modifications made to it can be put into force via
 /// [`RawInspector::set_threads`].
 
+#[derive(Clone, Debug)]
 pub struct ThreadList {
     pub(super) data: Vec<ThreadData>,
     pub(super) pid: pid_t

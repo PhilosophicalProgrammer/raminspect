@@ -44,7 +44,7 @@ impl MemoryRegion {
     /// not readable, and may spuriously fail if the memory region is shared (in which case
     /// you should always handle errors).
     
-    pub fn get_contents(&self, inspector: &mut RamInspector) -> Result<Vec<u8>> {
+    pub fn get_contents(&self, inspector: &RamInspector) -> Result<Vec<u8>> {
         inspector.read_vec(self.start_addr(), self.len())
     }
 

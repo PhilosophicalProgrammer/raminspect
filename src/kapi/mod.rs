@@ -103,17 +103,10 @@ impl RawInspector {
         let mut buf_len = 100;
 
         loop {
-            let mut thread_buffer: Vec<ThreadData> = Vec::with_capacity(buf_len);
             
             unsafe {
-                // Initialize the thread buffer.
-                for i in 0..(buf_len as isize) {
-                    // This is safe since `ThreadData` is always zeroable.
-                    thread_buffer.as_mut_ptr().offset(i).write(core::mem::zeroed());
-                }
-    
-                // Safe since we previously initialized all elements.
-                thread_buffer.set_len(buf_len);
+                // This is safe since `ThreadData` is always zeroable.
+                let mut thread_buffer: Vec<ThreadData> = vec![core::mem::zeroed(); buf_len];
 
                 // Execute the `ioctl`.
                 let mut request = ThreadRequest {
@@ -188,9 +181,9 @@ impl RawInspector {
     /// not restore the old state of the process or perform any kind of cleanup, and is meant to be a simple
     /// demonstration rather than something that actually functions in practice.
     /// 
-    /// If you want to successfully inject code, then see [`RamInspector::execute_shellcode`], which essentially
-    /// does the same thing as this example, but with additional measures in place to puase the other threads,
-    /// avoid detection, and restore the state of the process afterwards:
+    /// If you want to successfully inject code, then see [`RamInspector::execute_shellcode`], which does something
+    /// similar to this example, but with additional measures in place to pause the other threads, avoid detection, 
+    /// pass data to the shellcode, and restore the state of the process afterwards:
     /// 
     /// ```rust
     /// use raminspect::RamInspector;
@@ -205,14 +198,17 @@ impl RawInspector {
     /// let kapi = inspector.kernapi()?;
     /// inspector.do_while_paused(|inspector| unsafe {
     ///     // Make the memory region containing the main threads' instruction pointer writable so that we can modify it.
-    ///     let ip = kapi.get_threads()?.main().registers.inst_ptr();
+    ///     let ip = *kapi.get_threads()?.main().registers.inst_ptr();
     /// 
     ///     // This is guaranteed to exist, so it's safe to unwrap here.
-    ///     let mut code_region = inspector.regions().find(|region| region.addr_range().contains(ip)).unwrap();
+    ///     let mut code_region = inspector.regions().filter(MemoryRegion::executable).find(|region| {
+    ///         region.addr_range().contains(ip)
+    ///     }).unwrap();
+    ///     
     ///     kapi.set_vma_flags(&mut code_region, code_region.flags() | VmFlags::WR)?;
     /// 
     ///     // Now that it's writable, we insert our code.
-    ///     inspector.write_to_address(code_region.start_addr, injected_code)?;
+    ///     inspector.write_to_address(ip as usize, injected_code)?;
     /// })?;
     /// 
     /// // By now your injected code should be executing.
