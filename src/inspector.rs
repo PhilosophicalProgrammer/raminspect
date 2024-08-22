@@ -1,6 +1,7 @@
 //! This provides the structure that represents the interface of the library, [`RamInspector`]. See its
 //! documentation for more information.
 
+use std::ops::Deref; 
 use std::io::IoSlice;
 use std::io::IoSliceMut;
 
@@ -17,26 +18,28 @@ use nix::unistd::getpgid;
 use nix::unistd::sysconf;
 use nix::unistd::SysconfVar;
 
+use nix::sys::signal::signal;
 use nix::sys::signal::killpg;
 use nix::sys::signal::SigSet;
 use nix::sys::signal::SIGSTOP;
 use nix::sys::signal::SIGCONT;
 use nix::sys::signal::SIGUSR1;
+use nix::sys::signal::SigHandler;
+
 use nix::sys::uio::RemoteIoVec;
 use nix::sys::uio::process_vm_readv;
 use nix::sys::uio::process_vm_writev;
 
 use libc::pid_t;
+use libc::c_int;
 use procfs::process::Process;
 
 use crate::error::Result;
 use crate::kapi::RawInspector;
 use crate::error::RamInspectError as Error;
- 
+
 use crate::region::VmFlags;
 use crate::region::MemoryRegion;
-
-// TODO: Add signal handler.
 
 /// This is the primary interface used by the crate to search through, read, and modify an
 /// arbitrary processes' memory, registers, and code. All uses of this library must either
@@ -90,54 +93,22 @@ pub struct RamInspector {
     kapi: OnceCell<Result<RawInspector>>,
 }
 
-/// Used internally to define [`RamInspector::read_bulk`] and [`RamInspector::write_bulk`]. The common logic for reading and
-/// writing buffers paired with addresses via `iovec`s is extracted to this macro.
+/// Used internally in [`RamInspector::bulk_iov_op`]. This allows us to genericize over `IoSlice` and `IoSliceMut` by
+/// implementing the conversion of slices to IO slices.
 
-macro_rules! define_iov_op {
-    ($(#[$doc:meta])* $fname:ident<$bufty:ty, $slicety:ty, $sysfunc:ident, $errvariant:ident> $($unsafe:tt)?) => {
-        $(#[$doc])*
-        pub $($unsafe)? fn $fname<'a, O: Iterator<Item = (usize, $bufty)>>(&self, ops: O) -> Result<()> {
-            let (remotes, mut iovs): (Vec<_>, Vec<_>) = ops.map(|(base, buf)| (
-                RemoteIoVec {
-                    base,
-                    len: buf.len()
-                },
+trait FromBuffer<B>: Deref<Target = [u8]> {
+    fn from_buffer(buf: B) -> Self;
+}
 
-                <$slicety>::new(buf)
-            )).unzip();
+impl<'a> FromBuffer<&'a [u8]> for IoSlice<'a> {
+    fn from_buffer(buf: &'a [u8]) -> Self {
+        Self::new(buf)
+    }
+}
 
-            let mut i = 0;
-            while i < iovs.len() {
-                let end_index = (i + self.max_iovs).min(iovs.len());
-                let mut total_copied = 0;
-
-                // We keep attempting to copy until the full amount was read or written. If zero bytes were copied in an iteration
-                // of this loop, then we return early with `Error::Partial`.
-
-                'copy: while i < end_index {
-                    let pid = Pid::from_raw(self.proc.pid);
-                    let amount_copied = $sysfunc(pid, &mut iovs[i..end_index], &remotes[i..end_index]).map_err(|_| Error::$errvariant)?;
-
-                    total_copied += amount_copied;
-                    if amount_copied == 0 { return Err(Error::Partial(total_copied)); }
-
-                    // Check if the full amount was copied.
-                    let mut expected_amount = 0;
-
-                    while i < end_index {
-                        expected_amount += iovs[i].len();
-                        if expected_amount > amount_copied {
-                            // Try again starting from this index if less than the expected amount was copied.
-                            continue 'copy;
-                        }
-
-                        i += 1;
-                    }
-                }
-            }
-
-            Ok(())
-        }
+impl<'a> FromBuffer<&'a mut [u8]> for IoSliceMut<'a> {
+    fn from_buffer(buf: &'a mut [u8]) -> Self {
+        Self::new(buf)
     }
 }
 
@@ -147,6 +118,14 @@ impl RamInspector {
     /// [`RamInspector::do_while_paused`] for more information.
     
     pub fn new(pid: pid_t) -> Result<Self> {
+        unsafe {
+            // Install a signal handler that ignores `SIGUSR1`. This is necessary because of the semantics of
+            // `execute_shellcode`. See its documentation for more information.
+
+            extern "C" fn do_nothing(_n: c_int) {}
+            signal(SIGUSR1, SigHandler::Handler(do_nothing))?;
+        }
+
         Ok(Self {
             kapi: OnceCell::new(),
             process_paused: AtomicBool::new(false),
@@ -489,28 +468,76 @@ impl RamInspector {
     pub unsafe fn write_to_address(&self, addr: usize, buf: &[u8]) -> Result<()> {
         self.write_bulk([(addr, buf)].into_iter())
     }
+
+    /// Used internally to implement bulk reads and writes of data. It extracts the common logic of reading and
+    /// writing `iovec`s, namely: handling `iov_max`, handling partial reads or writes, creating a corresponding
+    /// buffer of `RemoteIoVec`s, and calling a `readv` or `writev` function that takes in this data.
     
-    define_iov_op! {
-        /// Performs many memory reads at once in one I/O syscall, taking in an iterator of address / output
-        /// buffer pairs as an argument. This can be much faster than [`RamInspector::read_address`] if 
-        /// you're making many reads, and should be preferred in that case. This has the same failure
-        /// conditions as `read_address`.
-        
-        read_bulk<&'a mut [u8], IoSliceMut, process_vm_readv, FailedToReadMem>
+    unsafe fn bulk_iov_op<B, S: FromBuffer<B>, O: Iterator<Item = (usize, B)>>(
+        &self, ops: O, sysfunc: fn(Pid, &mut [S], &[RemoteIoVec]) -> nix::Result<usize>, err: Error
+    ) -> Result<()> {
+        let (remotes, mut iovs): (Vec<_>, Vec<_>) = ops.map(|(base, buf)| {
+            let iov = S::from_buffer(buf);
+            (RemoteIoVec { base, len: iov.len() }, iov)
+        }).unzip();
+
+        let mut i = 0;
+        while i < iovs.len() {
+            let end_index = (i + self.max_iovs).min(iovs.len());
+            let mut total_copied = 0;
+
+            // We keep attempting to copy until the full amount was read or written. If zero bytes were copied in an iteration
+            // of this loop, then we return early with `Error::Partial`.
+
+            'copy: while i < end_index {
+                let pid = Pid::from_raw(self.proc.pid);
+                let amount_copied = sysfunc(pid, &mut iovs[i..end_index], &remotes[i..end_index]).map_err(|_| err)?;
+
+                total_copied += amount_copied;
+                if amount_copied == 0 { return Err(Error::Partial(total_copied)); }
+
+                // Check if the full amount was copied.
+                let mut expected_amount = 0;
+
+                while i < end_index {
+                    expected_amount += iovs[i].len();
+                    if expected_amount > amount_copied {
+                        // Try again starting from this index if less than the expected amount was copied.
+                        continue 'copy;
+                    }
+
+                    i += 1;
+                }
+            }
+        }
+
+        Ok(())
     }
 
+
+    /// Performs many memory reads at once in one I/O syscall, taking in an iterator of address / output
+    /// buffer pairs as an argument. This can be much faster than [`RamInspector::read_address`] if 
+    /// you're making many reads, and should be preferred in that case. This has the same failure
+    /// conditions as `read_address`.
     
-    define_iov_op! {
-        /// Write-side counterpart of [`RamInspector::read_bulk`]. Like `read_bulk`, this can be significantly
-        /// faster than the single-operation counterpart if you're moving multiple pieces of data, and should
-        /// be preferred in that case.
-        /// 
-        /// # Safety
-        /// 
-        /// This has the same failure conditions and safety concerns as [`RamInspector::write_to_address`].
-        /// See its documentation for more information.
-        
-        write_bulk<&'a [u8], IoSlice, process_vm_writev, FailedToWriteMem> unsafe
+    pub fn read_bulk<'a, O: Iterator<Item = (usize, &'a mut [u8])>>(&self, ops: O) -> Result<()> {
+        unsafe {
+            // Safe since we're just reading data and not actually modifying anything.
+            self.bulk_iov_op(ops, process_vm_readv, Error::FailedToReadMem)
+        }
+    }
+
+    /// Write-side counterpart of [`RamInspector::read_bulk`]. Like `read_bulk`, this can be significantly
+    /// faster than the single-operation counterpart if you're moving multiple pieces of data, and should
+    /// be preferred in that case.
+    /// 
+    /// # Safety
+    /// 
+    /// This has the same failure conditions and safety concerns as [`RamInspector::write_to_address`].
+    /// See its documentation for more information.
+
+    pub unsafe fn write_bulk<'a, O: Iterator<Item = (usize, &'a [u8])>>(&self, ops: O) -> Result<()> {
+        self.bulk_iov_op(ops, |pid, iovs, remotes| process_vm_writev(pid, iovs, remotes), Error::FailedToWriteMem)
     }
 
     /// A function that returns an iterator over the target processes' memory regions, generated by reading its
